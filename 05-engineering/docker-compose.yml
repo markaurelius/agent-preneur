@@ -1,0 +1,12 @@
+services:
+  engine:
+    build: .
+    env_file: .env
+    volumes:
+      - chroma_data:/app/chroma          # ChromaDB index (survives rebuilds)
+      - ./data:/app/data                 # SQLite DB + raw corpus files (host-inspectable)
+      - ./experiments:/app/experiments   # Run configs (edit on host, execute in container)
+      - ./notebooks:/app/notebooks       # Jupyter output synced back to host
+
+volumes:
+  chroma_data:

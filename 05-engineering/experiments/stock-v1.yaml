@@ -1,0 +1,10 @@
+name: stock-v1
+domain: finance
+corpus_collection: fundamentals
+top_k: 5
+similarity_type: embedding
+prompt_version: stock-v1
+model: claude-sonnet-4-6
+max_questions: 50
+workers: 5
+dry_run: false

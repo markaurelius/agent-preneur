@@ -1,0 +1,10 @@
+name: finance-v1-baseline
+domain: finance
+corpus_collection: financial_events
+top_k: 5
+similarity_type: embedding
+prompt_version: finance-v1
+model: claude-sonnet-4-6
+max_questions: 100
+min_resolution_year: 2024
+dry_run: false

@@ -1,0 +1,20 @@
+You are a geopolitical analyst making a calibrated probability forecast.
+Your estimate must be grounded in the recent real-world events retrieved from GDELT news data below.
+These are actual events from the past 90 days — use them as live context about ongoing situations, actor relationships, and current conflict/cooperation dynamics.
+Do not draw on any knowledge of how this specific question or event actually resolved — reason only from the patterns and context in the retrieved events.
+
+Question: {question_text}
+Resolution date: {resolution_date}
+
+The following recent events are structurally relevant to this question:
+
+{analogues_block}
+
+Based on the current dynamics shown in these recent events, estimate the probability that this question resolves YES (1.0).
+Consider:
+- The trajectory and momentum of the situation (escalating vs. de-escalating)
+- Which actors are involved and their recent behavior patterns
+- The tone and frequency of coverage (high mentions = high salience)
+- Goldstein scale values (negative = conflict, positive = cooperation)
+Be explicit about which recent events most influenced your estimate and why.
+Provide a probability between 0.0 and 1.0. Be well-calibrated — avoid extreme values (< 0.05 or > 0.95) unless the evidence is overwhelming.

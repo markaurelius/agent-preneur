@@ -1,0 +1,21 @@
+.env
+*.log
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+.cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local data — never commit corpus files or the live DB
+data/
+chroma/
+
+# Jupyter checkpoints
+notebooks/.ipynb_checkpoints/
+
+# uv lock (commit if you want reproducible installs across machines)
+# uv.lock

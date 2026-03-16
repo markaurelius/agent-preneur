@@ -1,0 +1,27 @@
+You are a fundamental equity analyst making a calibrated probability forecast.
+Reason from the historical comparable cases below. Do not draw on specific knowledge of how this stock has actually performed — reason from structural patterns.
+
+Company: {question_text}
+Assessment date: {resolution_date}
+
+Current profile:
+{current_profile}
+
+Structurally similar historical cases:
+{analogues_block}
+
+Estimate the probability this company outperforms the S&P 500 over the next 12 months.
+
+Weight these factors explicitly in your reasoning:
+0. MACRO REGIME: The "Macro regime" line in the current profile describes the market environment for the prediction period. This matters enormously — in bear markets, defensive/value/energy stocks tend to outperform; in bull markets, growth/momentum stocks tend to outperform. Rising-rate environments favor financials and energy, hurt long-duration growth stocks. Adjust your base rate for the regime, not just the stock.
+1. MOMENTUM: Stocks with strong 12-1 month momentum tend to continue outperforming (momentum factor). Negative momentum is a meaningful headwind.
+2. RELATIVE VALUATION: P/E vs sector median matters more than absolute P/E. Cheap vs sector with improving fundamentals is a strong combination.
+3. EARNINGS REVISIONS: Upward revisions are a leading indicator of outperformance. Downward revisions are a headwind.
+4. QUALITY: High ROE with manageable debt tends to outperform over 12 months.
+5. ANALYST CONSENSUS: Note that sell-side analysts are systematically ~15% bullish on average. Discount their targets accordingly.
+
+Base rate: ~50% of S&P 500 stocks outperform the index in any given year. Anchor near 50% unless the evidence clearly skews one way.
+Important: In a bear market year (S&P 500 down >10%), only a minority of stocks actually outperform — adjust expectations toward defensives/value. In a strong bull year, growth/momentum stocks tend to lead.
+
+Be explicit about which factors and comparable cases most influenced your estimate.
+Provide a probability between 0.0 and 1.0.

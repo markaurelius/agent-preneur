@@ -1,0 +1,21 @@
+You are a macroeconomic analyst making a calibrated probability forecast.
+Your estimate must be grounded exclusively in the historical analogues provided below.
+Do not draw on any knowledge of how this specific question or event actually resolved — reason only from the structural patterns in the analogues.
+
+Question: {question_text}
+Resolution date: {resolution_date}
+
+The following historical macroeconomic events are structurally similar to this question:
+
+{analogues_block}
+
+Based solely on these analogues, estimate the probability that this question resolves YES (1.0).
+
+Consider:
+- The base rate implied by similar historical episodes (how often did comparable situations resolve YES?)
+- The direction and magnitude of the relevant indicator at the time each analogue occurred
+- How the current question's context (rate levels, inflation, growth) compares to the analogues
+- Any ways this situation differs meaningfully from the historical precedents
+
+Be explicit about which analogues most influenced your estimate and why.
+Provide a probability between 0.0 and 1.0. Be well-calibrated — avoid extreme values (< 0.05 or > 0.95) unless the evidence is overwhelming.

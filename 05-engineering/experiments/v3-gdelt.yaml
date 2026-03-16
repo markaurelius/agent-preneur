@@ -1,0 +1,11 @@
+name: v3-gdelt
+domain: geopolitics
+corpus_collection: gdelt_events
+top_k: 5
+similarity_type: embedding
+prompt_version: gdelt-v1
+model: claude-sonnet-4-6
+max_questions: 50
+min_resolution_year: 2025
+workers: 10
+dry_run: false

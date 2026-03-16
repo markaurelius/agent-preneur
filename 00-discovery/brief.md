@@ -1,35 +1,37 @@
 # Discovery Brief
 
-> ~1 page. Answer concretely. If you can't answer a question, that's important signal.
-
 ## The Problem
 
-<!-- What is the problem? Who experiences it? How do they deal with it today?
-     Be specific — describe a real person's frustration, not an abstract market need. -->
+Geopolitical analysts pattern-match to 3-5 memorable historical cases when reasoning about current events — often the wrong ones. The full universe of relevant precedents is scattered across thousands of books, academic papers, declassified documents, and case studies. No single human can hold all of it simultaneously, so predictions are systematically biased toward salient/famous cases rather than the most structurally similar ones. The result: poor calibration, missed analogues, and expensive teams of historians to do what should be a computational problem.
 
 ## The Users
 
-<!-- Who specifically has this problem? Describe your primary user in one sentence.
-     What makes them the right early adopter? Why will they try something new? -->
+The system itself. This is a self-improving research tool — an agent that generates geopolitical predictions from historical analogues, tracks how events actually unfold, and updates its analogue-selection and weighting model based on prediction accuracy. No human end-user in v1.
 
 ## Why Now
 
-<!-- What's changed that makes this the right time to build this?
-     Technology shift, regulation change, market shift, behavior change? -->
+Three things converged:
+1. **LLMs can now synthesize qualitative, narrative historical data** — previously only structured data was computationally tractable; the richest historical knowledge lived in prose
+2. **Event databases and outcome trackers exist** — GDELT, ACLED, Correlates of War, Wikipedia event logs, and real-time news APIs provide both historical training material and live validation signals
+3. **Cost of iteration is near zero** — what previously required a team of historians and political scientists can now be run, evaluated, and iterated on by a single agent in a feedback loop
 
 ## What Success Looks Like
 
-<!-- At 12 months, what does good look like?
-     Name 1-2 concrete outcomes, not vanity metrics. -->
+At 12 months:
+- The system's geopolitical predictions show **improving calibration over time** — measured against Metaculus/Polymarket as a baseline for human+market consensus
+- The analogue retrieval improves measurably: later predictions draw on structurally better-matched historical cases than early ones (evaluable by retrospective scoring)
+- The feedback loop is self-sustaining: the system surfaces new scenarios, makes predictions, and validates them without manual intervention
 
 ---
 
 ## Open Questions
 
-<!-- Things you don't know yet that would change the direction -->
--
+- What historical event taxonomy works best for structural matching — geographic/temporal features, regime type, conflict type, or something else? Start with hypothesis, validate empirically.
+- How do we handle prediction timeframes? Short-horizon (weeks) vs. long-horizon (years) require different analogue types.
+- What's the right granularity for a "geopolitical scenario" as input?
 
 ## Decisions Made
 
-<!-- Fill in as you resolve open questions. Summarize into CLAUDE.md -->
--
+- Domain: geopolitical events (v1 scope)
+- Architecture: self-improving agent, not a human-facing product
+- Feedback loop: real-world outcome validation via news/event APIs, benchmarked against prediction markets

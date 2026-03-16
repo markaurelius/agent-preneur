@@ -5,14 +5,13 @@
 
 ## Status
 
-Current Phase: 00-discovery
-Stack: TBD
-Last Updated: <!-- update when you make changes -->
+Current Phase: 04-data (complete — ready to scaffold)
+Stack: Python / Claude API / ChromaDB / SQLite / Docker
+Last Updated: 2026-03-15
 
 ## Next Action
 
-Fill in `00-discovery/brief.md`. Answer the four questions as concretely as possible.
-Run `make status` to see progress across all phases.
+Run `make scaffold` to generate the engineering spec and code skeleton.
 
 ## Key Decisions
 
@@ -22,11 +21,11 @@ Run `make status` to see progress across all phases.
 ## Stack Choices
 
 <!-- Fill in once decided in 03-design or 05-engineering -->
-- Frontend: TBD
-- Backend: TBD
-- Database: TBD
-- Hosting: TBD
-- Auth: TBD
+- Frontend: None (CLI + Jupyter)
+- Backend: Python 3.11+
+- Database: SQLite (relational) + ChromaDB (vector)
+- Hosting: Docker (local), spun up on demand
+- Auth: None (env vars for API keys)
 
 ## Agent Org
 
@@ -47,3 +46,15 @@ Slash commands: `/interview` `/review [phase]` `/advance` `/build [task]`
 ## Decisions Log
 
 <!-- Running log — newest at top. Summarize decisions from each phase doc here. -->
+- [04] **Prompting is the primary tuning lever** — retrieval assumed adequate; versioned prompts with direct Brier score attribution are first-class
+- [04] **North star: mean Brier score trending down across runs** — lower is better; target measurable improvement by run 10
+- [03] **Docker-first** — containerized from day one so runs don't pollute local machine; data persisted in Docker volumes
+- [03] **Stack: Python + Claude API + ChromaDB + SQLite** — local-first, no cloud infra, runs on a laptop
+- [03] **Anthropic Claude (claude-sonnet-4-6) as default LLM** — configurable via env var
+- [02] **Offline-first training loop** — resolved Metaculus questions as training + validation set; fast iteration without waiting for live events
+- [02] **Analogue retrieval is the core research problem** — v1 investment concentrated here; synthesis/scoring are comparatively straightforward
+- [02] **No fine-tuning in v1** — retrieval updates via prompt-tuning or re-ranking weights; full fine-tuning deferred
+- [01] **Benchmark: Metaculus geopolitical questions + Brier score** — public, scored, represents informed human consensus; target ≥15% calibration improvement by month 12
+- [01] **No monetization in scope** — pure research tool; future licensing optionality noted but explicitly deferred
+- [00] **Self-improving agent, not a product** — no human end-user; the agent generates predictions, validates against real-world outcomes, and updates its own analogue model
+- [00] **Domain: geopolitical events (v1)** — scoped to constrain the feedback loop; architecture generalizes but calibration requires a measurable domain

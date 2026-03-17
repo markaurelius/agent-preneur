@@ -48,6 +48,7 @@ class HistoricalEvent(Base):
     date: Mapped[str | None] = mapped_column(String(10))  # ISO date string: YYYY-MM-DD
     region: Mapped[str | None] = mapped_column(String(128))
     chroma_id: Mapped[str | None] = mapped_column(String)  # ID in ChromaDB
+    outcome_binary: Mapped[float | None] = mapped_column(Float)  # 0.0=negative 1.0=positive; set by label_outcomes.py
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -65,6 +66,7 @@ class RunConfig(Base):
     metadata_filters: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     prompt_version: Mapped[str] = mapped_column(String(64), nullable=False, default="v1")
     model: Mapped[str] = mapped_column(String(128), nullable=False, default="claude-sonnet-4-6")
+    predictor_type: Mapped[str] = mapped_column(String(32), nullable=False, default="claude")
     max_questions: Mapped[int | None] = mapped_column(Integer)
     dry_run: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -102,6 +104,7 @@ class Prediction(Base):
     probability_estimate: Mapped[float | None] = mapped_column(Float)
     rationale: Mapped[str | None] = mapped_column(Text)
     analogues_used: Mapped[list | None] = mapped_column(JSON)  # [{event_id, similarity_score, features_used}]
+    features: Mapped[dict | None] = mapped_column(JSON)  # feature vector logged for ML analysis
     prompt_version: Mapped[str | None] = mapped_column(String(64))
     model: Mapped[str | None] = mapped_column(String(128))
     tokens_used: Mapped[int | None] = mapped_column(Integer)
@@ -111,6 +114,27 @@ class Prediction(Base):
     run: Mapped["RunResult"] = relationship(back_populates="predictions")
     question: Mapped["Question"] = relationship(back_populates="predictions")
     score: Mapped["Score | None"] = relationship(back_populates="prediction", uselist=False)
+
+
+class StockSnapshot(Base):
+    """Cached historical stock snapshot for a (ticker, year) pair.
+
+    Fetched once from yfinance by scripts/fetch_snapshots.py.
+    Reused by train_stocks.py and backtest_stocks.py so no yfinance
+    calls are needed during training/backtesting iterations.
+    """
+
+    __tablename__ = "stock_snapshots"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)  # f"snapshot-{ticker}-{year}"
+    ticker: Mapped[str] = mapped_column(String(16), nullable=False)
+    year: Mapped[int] = mapped_column(Integer, nullable=False)
+    snapshot_json: Mapped[dict] = mapped_column(JSON, nullable=False)   # full snapshot dict
+    features_json: Mapped[dict] = mapped_column(JSON, nullable=False)   # extracted feature dict
+    label: Mapped[float | None] = mapped_column(Float)           # 1.0 = outperformed SPY, 0.0 = not
+    stock_return: Mapped[float | None] = mapped_column(Float)    # stock annual return %
+    spy_return: Mapped[float | None] = mapped_column(Float)      # SPY annual return %
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class Score(Base):

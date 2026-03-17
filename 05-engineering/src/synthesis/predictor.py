@@ -22,6 +22,7 @@ class PredictionResult:
     rationale: str
     tokens_used: int
     latency_ms: int
+    features: dict | None = None  # feature vector logged for ML analysis
 
 
 def _load_prompt_template(prompt_version: str) -> str:

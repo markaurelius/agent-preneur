@@ -1,3 +1,5 @@
+# DEPRECATED — Correlates of War / geopolitics corpus is not the active focus.
+# This file is retained for reference only. Do not use in new work.
 """Ingest and embed historical geopolitical events from the CoW MID dataset."""
 
 import csv

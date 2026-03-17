@@ -13,11 +13,12 @@ from tqdm import tqdm
 from src.config.schema import RunConfig
 from src.db.models import Prediction, RunConfig as RunConfigModel, RunResult, Score
 from src.db.models import Question
-from src.ingestion.metaculus import _is_geopolitics
 from src.ingestion.finance_filter import _is_finance
 from src.retrieval.retriever import retrieve_analogues
 from src.scoring.scorer import ScoreResult, compute_run_stats, score_prediction
+from src.db.session import get_session as _default_get_session
 from src.synthesis.predictor import synthesize_prediction
+from src.synthesis.ml_predictor import AnaloguAggregator, MLPredictor
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ def run_offline_loop(
     session: Session,
     chroma_client,  # chromadb.ClientAPI
     anthropic_client,  # anthropic.Anthropic
+    _worker_session_factory=None,  # injectable for testing; defaults to get_session
 ) -> RunResult:
     """Run the full offline evaluation loop.
 
@@ -48,6 +50,7 @@ def run_offline_loop(
         metadata_filters=config.metadata_filters,
         prompt_version=config.prompt_version,
         model=config.model,
+        predictor_type=config.predictor_type,
         max_questions=config.max_questions,
         dry_run=config.dry_run,
     )
@@ -77,9 +80,7 @@ def run_offline_loop(
         .all()
     )
     # Filter by domain
-    domain_filter = {"geopolitics": _is_geopolitics, "finance": _is_finance}.get(
-        config.domain, _is_geopolitics
-    )
+    domain_filter = {"finance": _is_finance}.get(config.domain, _is_finance)
     questions = [q for q in all_questions if domain_filter(q.text or "")]
     logger.info(
         "domain=%s: filtered to %d questions out of %d total resolved",
@@ -107,13 +108,24 @@ def run_offline_loop(
     # ------------------------------------------------------------------
     # Step 4: Per-question loop
     # ------------------------------------------------------------------
+
+    # Initialise the predictor once — thread-safe (stateless after init)
+    if config.predictor_type == "analogue_aggregator":
+        _predictor = AnaloguAggregator()
+    elif config.predictor_type == "ml":
+        if not config.model_path:
+            raise ValueError("predictor_type='ml' requires model_path in the config")
+        _predictor = MLPredictor(config.model_path)
+    else:
+        _predictor = None  # will use synthesize_prediction (Claude)
+
     score_results: list[ScoreResult] = []
     score_lock = Lock()
 
+    _get_session = _worker_session_factory or _default_get_session
+
     def _process_question(question: Question) -> ScoreResult | None:
         """Process a single question in its own DB session. Thread-safe."""
-        from src.db.session import get_session as _get_session
-
         with _get_session() as worker_session:
             # Idempotency check
             existing = (
@@ -131,7 +143,11 @@ def run_offline_loop(
                 return None
 
             analogues = retrieve_analogues(question, config, chroma_client, worker_session, anthropic_client)
-            pred_result = synthesize_prediction(question, analogues, config, anthropic_client)
+
+            if _predictor is not None:
+                pred_result = _predictor.predict(question, analogues)
+            else:
+                pred_result = synthesize_prediction(question, analogues, config, anthropic_client)
 
             prediction = Prediction(
                 run_id=run_id,
@@ -142,6 +158,7 @@ def run_offline_loop(
                     {"event_id": a.event.id, "similarity_score": a.similarity_score}
                     for a in analogues
                 ],
+                features=pred_result.features,
                 prompt_version=config.prompt_version,
                 model=config.model,
                 tokens_used=pred_result.tokens_used,

@@ -324,8 +324,23 @@ def main() -> None:
         tickers = tickers[: config.max_questions]
 
     chroma_path = os.environ.get("CHROMA_PATH", "/app/chroma")
-    chroma_client = chromadb.PersistentClient(path=chroma_path)
-    anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    # ML predictor bypasses Claude and ChromaDB entirely
+    ml_predictor = None
+    if config.predictor_type == "ml":
+        if not config.model_path:
+            raise ValueError("predictor_type='ml' requires model_path in the config YAML")
+        from src.synthesis.stock_predictor import StockMLPredictor, confidence_label
+        ml_predictor = StockMLPredictor(config.model_path)
+        logger.info("ML mode — LightGBM predictor loaded from %s", config.model_path)
+
+    chroma_client = (
+        chromadb.PersistentClient(path=chroma_path) if ml_predictor is None else None
+    )
+    anthropic_client = (
+        anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        if ml_predictor is None
+        else None
+    )
 
     logger.info("Fetching current fundamental snapshots for %d tickers …", len(tickers))
     snapshots = get_current_snapshots(tickers)
@@ -381,24 +396,24 @@ def main() -> None:
                 continue
 
             try:
-                # Retrieve analogues from fundamentals corpus
-                analogues = retrieve_analogues(
-                    question, config, chroma_client, session, anthropic_client
-                )
-
-                # Build current profile string for prompt
-                current_profile = _format_current_profile(snap)
-
-                # Synthesize using stock-v1 prompt (bypasses generic synthesize_prediction
-                # because we need to inject {current_profile})
-                pred_result = _synthesize_stock_prediction(
-                    question_text=question.text,
-                    current_profile=current_profile,
-                    resolution_date_str=resolution_date_str,
-                    analogues=analogues,
-                    config=config,
-                    anthropic_client=anthropic_client,
-                )
+                if ml_predictor is not None:
+                    # Pure ML path — no Claude, no ChromaDB
+                    analogues = []
+                    pred_result = ml_predictor.predict(snap)
+                else:
+                    # Claude + analogue retrieval path
+                    analogues = retrieve_analogues(
+                        question, config, chroma_client, session, anthropic_client
+                    )
+                    current_profile = _format_current_profile(snap)
+                    pred_result = _synthesize_stock_prediction(
+                        question_text=question.text,
+                        current_profile=current_profile,
+                        resolution_date_str=resolution_date_str,
+                        analogues=analogues,
+                        config=config,
+                        anthropic_client=anthropic_client,
+                    )
 
                 prediction = Prediction(
                     run_id=run_id,
@@ -441,13 +456,21 @@ def main() -> None:
                     delta_str = ""
                     analyst_display = "(no analyst data)"
 
-                # Confidence = mean analogue similarity
-                if analogues:
+                # Confidence display
+                conf_level = None  # set for ML path; None for Claude path
+                if ml_predictor is not None:
+                    from src.synthesis.stock_predictor import confidence_label as _conf_label
+                    conf_level = _conf_label(pred_result.probability)
+                    conf_pct = (abs(pred_result.probability - 0.5) + 0.5) * 100
+                    conf_bar = _bar(conf_pct)
+                    conf_str = f"{conf_level:6s}  {conf_bar}  (ML confidence)"
+                elif analogues:
                     conf = sum(a.similarity_score for a in analogues) / len(analogues)
                     conf_pct = conf * 100
                     conf_bar = _bar(conf_pct)
                     conf_str = f"{conf_pct:5.1f}%  {conf_bar}"
                 else:
+                    conf_pct = 0
                     conf_str = "  N/A   (no corpus analogues found)"
 
                 # Price range display
@@ -466,17 +489,25 @@ def main() -> None:
                 rationale_short = pred_result.rationale.split(".")[0].strip() + "."
 
                 # Track for summary (always; com_pct may be None)
+                # For ML: conf_pct is model confidence (distance from 0.5 mapped to %)
+                # For Claude: conf_pct is mean analogue similarity
+                effective_conf_pct = conf_pct if (ml_predictor is not None or analogues) else 0
                 all_signals.append({
                     "ticker": ticker,
                     "our_pct": our_pct,
                     "com_pct": com_pct,
                     "delta": (our_pct - com_pct) if com_pct is not None else None,
-                    "conf_pct": conf_pct if analogues else 0,
+                    "conf_pct": effective_conf_pct,
+                    "conf_level": conf_level if ml_predictor is not None else None,
                 })
 
                 # Flag high-confidence divergences inline
                 signal_flag = ""
-                if com_pct is not None and analogues and conf_pct >= 50 and abs(our_pct - com_pct) >= 15:
+                is_high_conf = (
+                    (ml_predictor is not None and conf_level == "high")
+                    or (ml_predictor is None and analogues and conf_pct >= 50)
+                )
+                if com_pct is not None and is_high_conf and abs(our_pct - com_pct) >= 15:
                     signal_flag = "  *** SIGNAL ***"
 
                 print(f"\n[{i}/{len(snapshots)}] {ticker} — {company_name}{signal_flag}")
@@ -508,11 +539,18 @@ def main() -> None:
 
         # --- Divergence signals ---
         # High confidence + large delta from analyst consensus = interesting signal
+        # For ML: high confidence means conf_level == "high" (|prob - 0.5| >= 0.20)
+        # For Claude: high confidence means conf_pct >= 50 (mean analogue similarity)
         signals = [
             s for s in all_signals
-            if s["delta"] is not None and s["conf_pct"] >= 50 and abs(s["delta"]) >= 15
+            if s["delta"] is not None
+            and abs(s["delta"]) >= 15
+            and (
+                (s.get("conf_level") == "high")  # ML path
+                or (s.get("conf_level") is None and s["conf_pct"] >= 50)  # Claude path
+            )
         ]
-        signals.sort(key=lambda s: (s["conf_pct"] * abs(s["delta"])), reverse=True)
+        signals.sort(key=lambda s: abs(s["delta"]), reverse=True)
 
         # --- Calibration summary ---
         scored = [s for s in all_signals if s["com_pct"] is not None]

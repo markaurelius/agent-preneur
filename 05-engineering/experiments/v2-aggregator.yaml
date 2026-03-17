@@ -1,0 +1,9 @@
+name: v2-aggregator
+domain: finance
+predictor_type: analogue_aggregator
+corpus_collection: fundamentals
+top_k: 5
+similarity_type: embedding
+max_questions: 100
+min_resolution_year: 2024
+dry_run: false

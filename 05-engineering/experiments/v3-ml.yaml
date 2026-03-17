@@ -1,0 +1,10 @@
+name: v3-ml
+domain: finance
+predictor_type: ml
+model_path: data/models/lr_v1.pkl
+corpus_collection: fundamentals
+top_k: 5
+similarity_type: embedding
+max_questions: 100
+min_resolution_year: 2024
+dry_run: false

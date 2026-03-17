@@ -1,0 +1,10 @@
+name: stock-ml-v1
+domain: finance
+predictor_type: ml
+model_path: data/models/lgbm_stock_v1.pkl
+corpus_collection: fundamentals
+top_k: 5
+similarity_type: embedding
+max_questions: 50
+dry_run: false
+prompt_version: stock-v1

@@ -5,9 +5,11 @@
 
 ## Vision
 
-A domain-agnostic self-improving prediction agent. Given any question about the future, it finds structurally similar historical events, uses Claude to reason from those analogues, and scores predictions against known resolutions (Brier score).
+A domain-agnostic self-improving prediction agent. Given any question about the future, it finds structurally similar historical events, generates a calibrated probability from those analogues, and improves through a fast ML training loop scored against known resolutions (Brier score).
 
-The key insight: Claude's knowledge has a training cutoff. For questions that resolve *after* that cutoff, Claude cannot simply recall the answer — it must reason. The better the historical analogues, the better the reasoning. This creates a tight feedback loop: better corpora → better retrieval → lower Brier score.
+The key insight: retrieval is the signal, not the LLM. A trained model that learns which analogue features correlate with question resolution can iterate orders of magnitude faster than prompt-engineering a Claude call per prediction.
+
+**Claude's role in v2+**: one-time corpus enrichment (outcome labeling) and orchestration — not per-prediction synthesis.
 
 **v1 domain: geopolitics.** The architecture is built to be domain-agnostic from day one.
 
@@ -19,20 +21,29 @@ The key insight: Claude's knowledge has a training cutoff. For questions that re
 ┌─────────────────────────────────────────────────────────────────┐
 │  CORPUS (one-time setup per domain)                             │
 │  Historical events → embed → ChromaDB + SQLite                  │
+│  outcome_binary labels → label_outcomes.py (Claude, once)       │
 └─────────────────────────────────────────────────────────────────┘
                           │
                           ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  OFFLINE LOOP (evaluation / training)                           │
-│  Resolved questions → retrieve analogues → Claude → Brier score │
-│  Iterate on prompts, corpora, retrieval strategies              │
+│  TRAINING LOOP (scripts/train.py)                               │
+│  Resolved questions → retrieve analogues → feature extraction   │
+│  → LogisticRegression (calibrated) → CV Brier score             │
+│  → save model artifact (joblib)                                 │
+└─────────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  OFFLINE EVALUATION (scripts/run.py)                            │
+│  predictor_type: analogue_aggregator | ml | claude              │
+│  Resolved questions → retrieve → predict → Brier score          │
 └─────────────────────────────────────────────────────────────────┘
                           │
                           ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  LIVE FORECASTING                                               │
-│  Open questions → retrieve analogues → Claude → store prediction│
-│  Score when questions resolve                                   │
+│  Open questions → retrieve analogues → ML predict → store       │
+│  Score when questions resolve → retrain loop                    │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -55,7 +66,9 @@ All data local. No web UI. No cloud infra. Runs in Docker.
 │   ├── retrieval/
 │   │   └── retriever.py       — embedding / metadata / hybrid retrieval modes
 │   ├── synthesis/
-│   │   ├── predictor.py       — Claude tool_use structured prediction
+│   │   ├── predictor.py       — Claude tool_use structured prediction (predictor_type: claude)
+│   │   ├── feature_extractor.py — numeric features from (question, analogues) pairs
+│   │   ├── ml_predictor.py    — AnaloguAggregator + MLPredictor (sklearn)
 │   │   └── prompts/
 │   │       └── v1.txt         — prompt template v1
 │   ├── scoring/
@@ -70,7 +83,9 @@ All data local. No web UI. No cloud infra. Runs in Docker.
 │   ├── run.py                 — CLI: offline evaluation loop
 │   ├── ingest.py              — CLI: ingest questions or corpus
 │   ├── forecast.py            — CLI: predict on live open questions
-│   └── resolve.py             — CLI: score predictions when questions close
+│   ├── resolve.py             — CLI: score predictions when questions close
+│   ├── train.py               — CLI: train ML predictor on historical data
+│   └── label_outcomes.py      — CLI: Claude-assisted one-time outcome labeling
 ├── data/                      — gitignored; Docker bind mount
 │   └── corpus/                — raw dataset CSVs
 ├── Dockerfile
@@ -220,18 +235,29 @@ python scripts/resolve.py
 
 ---
 
-## Prompt Iteration Workflow
+## ML Iteration Workflow
 
 ```
-experiments/v1.yaml  →  src/synthesis/prompts/v1.txt  →  mean_brier: 0.1558  (baseline)
-experiments/v2.yaml  →  src/synthesis/prompts/v2.txt  →  mean_brier: ?
+# Step 1 (once): label corpus outcomes
+python scripts/label_outcomes.py
+
+# Step 2: establish analogue-aggregator baseline (no training, no API calls)
+python scripts/run.py --config experiments/v2-aggregator.yaml
+
+# Step 3: train ML model
+python scripts/train.py --config experiments/v2-aggregator.yaml --output data/models/lr_v1.pkl
+
+# Step 4: evaluate ML model
+python scripts/run.py --config experiments/v3-ml.yaml
 ```
 
-To run a new experiment:
-1. Copy `prompts/v1.txt` → `prompts/v2.txt`, edit the prompt
-2. Copy `experiments/v1.yaml` → `experiments/v2.yaml`, set `prompt_version: v2`
-3. Run: `python scripts/run.py --config experiments/v2.yaml`
-4. Compare Brier scores between runs
+To iterate on the ML model:
+- Add/remove features in `src/synthesis/feature_extractor.py`
+- Re-run `train.py`, compare CV Brier scores
+- Change retrieval config (top_k, similarity_type) in the experiment YAML
+- No API calls required for steps 2–4 once the corpus is labeled
+
+Claude predictor still available for comparison: `experiments/v1.yaml` (`predictor_type: claude`).
 
 ---
 

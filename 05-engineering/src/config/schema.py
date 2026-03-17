@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Optional
 
 import yaml
 from pydantic import BaseModel, Field, model_validator
@@ -10,13 +10,15 @@ from pydantic import BaseModel, Field, model_validator
 
 class RunConfig(BaseModel):
     name: str
-    domain: Literal["geopolitics", "finance"] = "geopolitics"
+    domain: Literal["geopolitics", "finance"] = "finance"
     corpus_collection: str = "historical_events"
     top_k: int = Field(default=5, ge=1, le=50)
     similarity_type: Literal["embedding", "hybrid", "metadata", "claude"] = "embedding"
     embedding_weight: float = Field(default=0.7, ge=0.0, le=1.0)
     metadata_weight: float = Field(default=0.3, ge=0.0, le=1.0)
     metadata_filters: dict = Field(default_factory=dict)
+    predictor_type: Literal["claude", "analogue_aggregator", "ml"] = "claude"
+    model_path: Optional[str] = None  # required when predictor_type == "ml"
     prompt_version: str = "v1"
     model: str = "claude-sonnet-4-6"
     max_questions: int | None = Field(default=None, ge=1)

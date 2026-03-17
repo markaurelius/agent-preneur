@@ -640,12 +640,24 @@ def main() -> None:
     else:
         years = _DEFAULT_YEARS
 
+    # ML predictor bypasses Claude and ChromaDB entirely
+    ml_predictor = None
+    if config.predictor_type == "ml":
+        if not config.model_path:
+            raise ValueError("predictor_type='ml' requires model_path in the config YAML")
+        from src.synthesis.stock_predictor import StockMLPredictor
+        ml_predictor = StockMLPredictor(config.model_path)
+        logger.info("ML mode — LightGBM predictor loaded from %s", config.model_path)
+
     chroma_path = os.environ.get("CHROMA_PATH", "/app/chroma")
-    chroma_client = chromadb.PersistentClient(path=chroma_path)
+    chroma_client = chromadb.PersistentClient(path=chroma_path) if ml_predictor is None else None
 
     if dry_run:
         anthropic_client = None
         logger.info("DRY RUN mode — Claude API calls skipped")
+    elif ml_predictor is not None:
+        anthropic_client = None
+        logger.info("ML mode — Claude API calls skipped")
     else:
         anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
@@ -654,15 +666,14 @@ def main() -> None:
         len(tickers), len(years), len(tickers) * len(years),
     )
 
-    # Pre-fetch SPY for benchmark returns
-    logger.info("Fetching SPY data for benchmark returns ...")
-    spy = yf.Ticker(_SPY_TICKER)
-
-    # Cache SPY annual returns
+    # SPY benchmark returns — only needed for Claude path (ML path uses cached values)
     spy_returns: dict[int, float | None] = {}
-    for yr in years:
-        spy_returns[yr] = _fetch_spy_annual_return(spy, yr)
-        logger.debug("SPY %d: %s", yr, spy_returns[yr])
+    if ml_predictor is None:
+        logger.info("Fetching SPY data for benchmark returns ...")
+        spy = yf.Ticker(_SPY_TICKER)
+        for yr in years:
+            spy_returns[yr] = _fetch_spy_annual_return(spy, yr)
+            logger.debug("SPY %d: %s", yr, spy_returns[yr])
 
     with get_session() as session:
         run_name = (
@@ -705,78 +716,288 @@ def main() -> None:
         skipped_no_data = 0
 
         # ---------------------------------------------------------------
-        # Phase 1: Data preparation (sequential — yfinance + DB reads)
-        # Build all work items before any API calls.
+        # Phase 1: Data preparation
+        # ML path: reads from DB cache (instant — no yfinance calls).
+        # Claude path: fetches from yfinance (slow, but necessary for analogues).
         # ---------------------------------------------------------------
         work_items: list[dict] = []
 
-        for ticker in tickers:
+        if ml_predictor is not None:
+            # --- Walk-forward ML path: train per-fold models inline ---
+            # This avoids data leakage from the pre-trained model (which was
+            # trained on ALL years). For each test year Y we train a fresh
+            # LightGBM+calibration pipeline on years < Y only.
+            from src.db.models import StockSnapshot
+            from src.synthesis.stock_features import STOCK_FEATURE_NAMES, features_to_vector
+
+            import numpy as np
             try:
-                t = yf.Ticker(ticker)
-                info = t.info or {}
-            except Exception as exc:
-                logger.warning("Cannot fetch info for %s: %s — skipping", ticker, exc)
-                continue
+                import lightgbm as lgb
+            except ImportError:
+                logger.error("lightgbm not installed. Rebuild Docker image: make build")
+                raise SystemExit(1)
+            from sklearn.calibration import CalibratedClassifierCV
 
-            for year in years:
-                label = f"{ticker} {year}"
+            # Load ALL cached snapshots (all years with labels) for walk-forward training
+            all_cached = (
+                session.query(StockSnapshot)
+                .filter(
+                    StockSnapshot.ticker.in_(tickers),
+                    StockSnapshot.label.isnot(None),
+                )
+                .all()
+            )
+            if not all_cached:
+                logger.error(
+                    "No cached snapshots found for ML backtest. "
+                    "Run 'make fetch-snapshots' first."
+                )
+                raise SystemExit(1)
 
-                stock_return = _fetch_annual_return(t, year)
-                spy_return = spy_returns.get(year)
-                if stock_return is None or spy_return is None:
-                    skipped_no_data += 1
+            logger.info(
+                "Walk-forward ML path: loaded %d total snapshots from DB cache",
+                len(all_cached),
+            )
+
+            # Group all rows by year
+            all_years_in_db = sorted(set(r.year for r in all_cached))
+            logger.info("Years available in DB: %s", all_years_in_db)
+
+            # Determine which test years are evaluable:
+            # need at least 2 prior years of training data
+            _MIN_TRAIN_YEARS = 2
+            _MIN_TRAIN_EXAMPLES = 30
+
+            # Build a lookup dict: year -> list of rows
+            rows_by_year: dict[int, list] = {}
+            for r in all_cached:
+                rows_by_year.setdefault(r.year, []).append(r)
+
+            # Pre-compute walk-forward predictions for each test year
+            wf_predictions: dict[tuple[str, int], float] = {}  # (ticker, year) -> prob
+
+            test_years_evaluated = []
+            for test_year in years:
+                prior_years = [y for y in all_years_in_db if y < test_year]
+                if len(prior_years) < _MIN_TRAIN_YEARS:
+                    logger.warning(
+                        "Skipping test_year=%d: only %d prior year(s) available "
+                        "(need at least %d)",
+                        test_year, len(prior_years), _MIN_TRAIN_YEARS,
+                    )
                     continue
 
-                resolution = 1.0 if stock_return > spy_return else 0.0
-                actual_delta_pct = (stock_return - spy_return) * 100
-
-                try:
-                    snap = _build_historical_snapshot(t, ticker, year, info)
-                except Exception as exc:
-                    logger.warning("%s — snapshot error: %s", label, exc)
-                    skipped_no_data += 1
+                train_rows = [r for y in prior_years for r in rows_by_year.get(y, [])]
+                if len(train_rows) < _MIN_TRAIN_EXAMPLES:
+                    logger.warning(
+                        "Skipping test_year=%d: only %d training examples "
+                        "(need at least %d)",
+                        test_year, len(train_rows), _MIN_TRAIN_EXAMPLES,
+                    )
                     continue
 
-                question = _upsert_backtest_question(snap, year, session)
+                test_rows = rows_by_year.get(test_year, [])
+                if not test_rows:
+                    logger.warning("Skipping test_year=%d: no test rows in DB", test_year)
+                    continue
+
+                # Build train arrays
+                X_tr = np.array([features_to_vector(r.features_json) for r in train_rows])
+                y_tr = np.array([float(r.label) for r in train_rows])
+
+                n_pos_f = float(y_tr.sum())
+                n_neg_f = len(y_tr) - n_pos_f
+                spw_f = n_neg_f / n_pos_f if n_pos_f > 0 else 1.0
+
+                logger.info(
+                    "Walk-forward: test_year=%d  train_years=%s  n_train=%d  "
+                    "n_test=%d  scale_pos_weight=%.2f",
+                    test_year, prior_years, len(train_rows), len(test_rows), spw_f,
+                )
+
+                fold_model = CalibratedClassifierCV(
+                    lgb.LGBMClassifier(
+                        objective="binary",
+                        n_estimators=100,
+                        learning_rate=0.05,
+                        num_leaves=15,
+                        min_child_samples=5,
+                        scale_pos_weight=spw_f,
+                        random_state=42,
+                        verbose=-1,
+                    ),
+                    cv=min(3, len(set(y_tr.astype(int)))),
+                    method="isotonic",
+                )
+                import pandas as pd
+                fold_model.fit(
+                    pd.DataFrame(X_tr, columns=STOCK_FEATURE_NAMES), y_tr
+                )
+
+                # Predict for all test rows
+                X_te = np.array([features_to_vector(r.features_json) for r in test_rows])
+                probs = fold_model.predict_proba(
+                    pd.DataFrame(X_te, columns=STOCK_FEATURE_NAMES)
+                )[:, 1].tolist()
+
+                for row, prob in zip(test_rows, probs):
+                    prob_clipped = max(0.01, min(0.99, prob))
+                    wf_predictions[(row.ticker, row.year)] = prob_clipped
+
+                test_years_evaluated.append(test_year)
+
+            if not wf_predictions:
+                logger.error(
+                    "Walk-forward produced no predictions. "
+                    "Check that snapshots cover at least %d prior years before the test years.",
+                    _MIN_TRAIN_YEARS,
+                )
+                raise SystemExit(1)
+
+            logger.info(
+                "Walk-forward complete: %d predictions across years %s",
+                len(wf_predictions), test_years_evaluated,
+            )
+
+            # Now build work_items using the pre-computed walk-forward probabilities.
+            # Only include (ticker, year) pairs that were evaluated.
+            cached_test = (
+                session.query(StockSnapshot)
+                .filter(
+                    StockSnapshot.ticker.in_(tickers),
+                    StockSnapshot.year.in_(test_years_evaluated),
+                    StockSnapshot.label.isnot(None),
+                )
+                .all()
+            )
+
+            for row in cached_test:
+                key = (row.ticker, row.year)
+                if key not in wf_predictions:
+                    continue  # was skipped (e.g. not enough training data)
+
+                snap = row.snapshot_json
+                resolution = float(row.label)
+                stock_ret = (row.stock_return or 0.0) / 100
+                spy_ret = (row.spy_return or 0.0) / 100
+                actual_delta_pct = (stock_ret - spy_ret) * 100
+
+                question = _upsert_backtest_question(snap, row.year, session)
                 if question.resolution_value is None:
                     question.resolution_value = resolution
                 session.commit()
 
-                # Re-use if already predicted in this run
                 existing_pred = session.query(Prediction).filter_by(
                     run_id=run_id, question_id=question.id
                 ).first()
                 if existing_pred:
                     prob = existing_pred.probability_estimate or 0.5
                     scored_records.append({
-                        "ticker": ticker, "year": year,
+                        "ticker": row.ticker, "year": row.year,
                         "probability": prob, "resolution": resolution,
                         "brier_score": (prob - resolution) ** 2,
                         "actual_delta_pct": actual_delta_pct,
                     })
                     continue
 
-                try:
-                    analogues = _retrieve_analogues_time_filtered(
-                        question=question, config=config,
-                        chroma_client=chroma_client, session=session,
-                        anthropic_client=anthropic_client, cutoff_year=year,
-                    )
-                except Exception as exc:
-                    logger.warning("%s — retrieval error: %s", label, exc)
-                    analogues = []
+                # Use pre-computed walk-forward probability (not ml_predictor.predict())
+                wf_prob = wf_predictions[key]
+                conf = "high" if abs(wf_prob - 0.5) >= 0.20 else "medium" if abs(wf_prob - 0.5) >= 0.10 else "low"
+                direction = "bullish" if wf_prob >= 0.5 else "bearish"
+                features = row.features_json or {}
+                rationale = (
+                    f"Walk-forward LightGBM {direction} ({wf_prob:.1%}) — "
+                    f"confidence: {conf}  |  "
+                    f"pe_vs_sector={features.get('pe_vs_sector', 0.0):.2f}, "
+                    f"momentum={features.get('momentum_12_1', 0.0):+.1f}%, "
+                    f"revenue_growth={features.get('revenue_growth_ttm', 0.0):+.1f}%"
+                )
 
                 work_items.append({
-                    "ticker": ticker,
-                    "year": year,
+                    "ticker": row.ticker,
+                    "year": row.year,
                     "question_id": question.id,
                     "question_text": question.text,
                     "current_profile": _format_current_profile(snap),
-                    "resolution_date_str": f"{year + 1}-01-01",
-                    "analogues": analogues,
+                    "resolution_date_str": f"{row.year + 1}-01-01",
+                    "snap": snap,
+                    "analogues": [],
                     "resolution": resolution,
                     "actual_delta_pct": actual_delta_pct,
+                    # Pre-computed walk-forward probability and rationale
+                    "wf_probability": wf_prob,
+                    "wf_rationale": rationale,
                 })
+
+        else:
+            # --- Claude path: fetch from yfinance ---
+            for ticker in tickers:
+                try:
+                    t = yf.Ticker(ticker)
+                    info = t.info or {}
+                except Exception as exc:
+                    logger.warning("Cannot fetch info for %s: %s — skipping", ticker, exc)
+                    continue
+
+                for year in years:
+                    label = f"{ticker} {year}"
+
+                    stock_return = _fetch_annual_return(t, year)
+                    spy_return = spy_returns.get(year)
+                    if stock_return is None or spy_return is None:
+                        skipped_no_data += 1
+                        continue
+
+                    resolution = 1.0 if stock_return > spy_return else 0.0
+                    actual_delta_pct = (stock_return - spy_return) * 100
+
+                    try:
+                        snap = _build_historical_snapshot(t, ticker, year, info)
+                    except Exception as exc:
+                        logger.warning("%s — snapshot error: %s", label, exc)
+                        skipped_no_data += 1
+                        continue
+
+                    question = _upsert_backtest_question(snap, year, session)
+                    if question.resolution_value is None:
+                        question.resolution_value = resolution
+                    session.commit()
+
+                    existing_pred = session.query(Prediction).filter_by(
+                        run_id=run_id, question_id=question.id
+                    ).first()
+                    if existing_pred:
+                        prob = existing_pred.probability_estimate or 0.5
+                        scored_records.append({
+                            "ticker": ticker, "year": year,
+                            "probability": prob, "resolution": resolution,
+                            "brier_score": (prob - resolution) ** 2,
+                            "actual_delta_pct": actual_delta_pct,
+                        })
+                        continue
+
+                    analogues = []
+                    try:
+                        analogues = _retrieve_analogues_time_filtered(
+                            question=question, config=config,
+                            chroma_client=chroma_client, session=session,
+                            anthropic_client=anthropic_client, cutoff_year=year,
+                        )
+                    except Exception as exc:
+                        logger.warning("%s — retrieval error: %s", label, exc)
+
+                    work_items.append({
+                        "ticker": ticker,
+                        "year": year,
+                        "question_id": question.id,
+                        "question_text": question.text,
+                        "current_profile": _format_current_profile(snap),
+                        "resolution_date_str": f"{year + 1}-01-01",
+                        "snap": snap,
+                        "analogues": analogues,
+                        "resolution": resolution,
+                        "actual_delta_pct": actual_delta_pct,
+                    })
 
         logger.info(
             "Data prep complete. %d predictions to synthesize, %d already done, %d skipped.",
@@ -791,15 +1012,24 @@ def main() -> None:
         completed_count = 0
 
         def _synthesize_item(item: dict) -> dict:
-            probability, rationale, tokens_used, latency_ms = _synthesize_backtest_prediction(
-                question_text=item["question_text"],
-                current_profile=item["current_profile"],
-                resolution_date_str=item["resolution_date_str"],
-                analogues=item["analogues"],
-                config=config,
-                anthropic_client=anthropic_client,
-                dry_run=dry_run,
-            )
+            if ml_predictor is not None:
+                # Use pre-computed walk-forward probability (no data leakage).
+                # wf_probability was computed by a model trained only on years
+                # strictly before item["year"].
+                probability = item["wf_probability"]
+                rationale = item["wf_rationale"]
+                tokens_used = 0
+                latency_ms = 0
+            else:
+                probability, rationale, tokens_used, latency_ms = _synthesize_backtest_prediction(
+                    question_text=item["question_text"],
+                    current_profile=item["current_profile"],
+                    resolution_date_str=item["resolution_date_str"],
+                    analogues=item["analogues"],
+                    config=config,
+                    anthropic_client=anthropic_client,
+                    dry_run=dry_run,
+                )
             return {**item, "probability": probability, "rationale": rationale,
                     "tokens_used": tokens_used, "latency_ms": latency_ms}
 

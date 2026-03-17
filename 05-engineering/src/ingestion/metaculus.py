@@ -1,3 +1,5 @@
+# DEPRECATED — geopolitics/Metaculus domain is not the active focus.
+# This file is retained for reference only. Do not use in new work.
 """Load and store resolved binary questions from the nikhilchandak/metaculus-binary HuggingFace dataset.
 
 Dataset: https://huggingface.co/datasets/nikhilchandak/metaculus-binary

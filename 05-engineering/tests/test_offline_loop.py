@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from src.config.schema import RunConfig
 from src.db.models import Base, Prediction, Question, RunResult, Score
@@ -22,9 +23,13 @@ from src.runner.offline_loop import run_offline_loop
 
 
 def _make_engine():
+    # StaticPool forces all connections to share the same in-memory DB, which
+    # is required so worker threads in the offline loop see the same data as
+    # the test's main session.
     engine = create_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
         echo=False,
     )
     Base.metadata.create_all(engine)
@@ -48,7 +53,7 @@ def _make_config(**kwargs) -> RunConfig:
 
 def _make_question(
     id: str = "q1",
-    text: str = "Will event X happen?",
+    text: str = "Will Russia invade Ukraine?",  # must pass _is_geopolitics filter
     resolution_value: float = 1.0,
     community_probability: float | None = 0.6,
 ) -> Question:
@@ -68,6 +73,7 @@ def _make_mock_analogues():
         id="event-1",
         description="Historical conflict in region Z",
         outcome="Conflict was resolved diplomatically",
+        outcome_binary=None,
         actors=None,
         event_type="conflict",
         date="2000-01-01",
@@ -90,6 +96,24 @@ def _make_mock_analogues():
 
 RETRIEVE_PATCH = "src.runner.offline_loop.retrieve_analogues"
 SYNTHESIZE_PATCH = "src.runner.offline_loop.synthesize_prediction"
+GET_SESSION_PATCH = "src.db.session.get_session"  # worker threads call this
+
+
+from contextlib import contextmanager
+
+
+def _session_patcher(Session):
+    """Patch src.db.session.get_session to use a given sessionmaker.
+
+    The worker thread in offline_loop imports get_session at call time, so patching
+    the module-level function redirects worker DB access to the test's in-memory DB.
+    """
+    @contextmanager
+    def _fake_get_session():
+        with Session() as s:
+            yield s
+
+    return patch(GET_SESSION_PATCH, side_effect=_fake_get_session)
 
 
 def _mock_prediction_result():
@@ -132,7 +156,7 @@ class TestFullDryRun:
         with Session() as session:
             with patch(RETRIEVE_PATCH, return_value=_make_mock_analogues()), \
                  patch(SYNTHESIZE_PATCH, return_value=_mock_prediction_result()):
-                result = run_offline_loop(config, session, chroma_client, anthropic_client)
+                result = run_offline_loop(config, session, chroma_client, anthropic_client, _worker_session_factory=Session)
 
         assert result.n_predictions == 3
 
@@ -149,7 +173,7 @@ class TestFullDryRun:
         with Session() as session:
             with patch(RETRIEVE_PATCH, return_value=_make_mock_analogues()), \
                  patch(SYNTHESIZE_PATCH, return_value=_mock_prediction_result()):
-                result = run_offline_loop(config, session, MagicMock(), MagicMock())
+                result = run_offline_loop(config, session, MagicMock(), MagicMock(), _worker_session_factory=Session)
 
         assert isinstance(result, RunResult)
         assert result.id is not None
@@ -168,7 +192,7 @@ class TestFullDryRun:
         with Session() as session:
             with patch(RETRIEVE_PATCH, return_value=_make_mock_analogues()), \
                  patch(SYNTHESIZE_PATCH, return_value=_mock_prediction_result()):
-                result = run_offline_loop(config, session, MagicMock(), MagicMock())
+                result = run_offline_loop(config, session, MagicMock(), MagicMock(), _worker_session_factory=Session)
             run_id = result.id
 
         # Verify it's actually in the DB in a fresh session
@@ -196,7 +220,7 @@ class TestIdempotency:
         with Session() as session:
             with patch(RETRIEVE_PATCH, return_value=_make_mock_analogues()), \
                  patch(SYNTHESIZE_PATCH, synth_mock):
-                result = run_offline_loop(config, session, MagicMock(), MagicMock())
+                result = run_offline_loop(config, session, MagicMock(), MagicMock(), _worker_session_factory=Session)
             run_id = result.id
 
         # Run again with same run_id (simulate by manually injecting existing prediction)
@@ -241,7 +265,7 @@ class TestIdempotency:
         with Session() as session:
             with patch(RETRIEVE_PATCH, return_value=_make_mock_analogues()), \
                  patch(SYNTHESIZE_PATCH, side_effect=counting_synthesize):
-                result1 = run_offline_loop(config, session, MagicMock(), MagicMock())
+                result1 = run_offline_loop(config, session, MagicMock(), MagicMock(), _worker_session_factory=Session)
 
         assert synth_call_count == 1
 
@@ -281,7 +305,7 @@ class TestExceptionHandling:
         with Session() as session:
             with patch(RETRIEVE_PATCH, return_value=_make_mock_analogues()), \
                  patch(SYNTHESIZE_PATCH, side_effect=flaky_synthesize):
-                result = run_offline_loop(config, session, MagicMock(), MagicMock())
+                result = run_offline_loop(config, session, MagicMock(), MagicMock(), _worker_session_factory=Session)
 
         # Run completes despite one failure
         assert isinstance(result, RunResult)
@@ -307,7 +331,7 @@ class TestExceptionHandling:
             with Session() as session:
                 with patch(RETRIEVE_PATCH, return_value=_make_mock_analogues()), \
                      patch(SYNTHESIZE_PATCH, side_effect=always_fails):
-                    run_offline_loop(config, session, MagicMock(), MagicMock())
+                    run_offline_loop(config, session, MagicMock(), MagicMock(), _worker_session_factory=Session)
 
         assert any("q1" in record.message for record in caplog.records)
 
@@ -329,7 +353,7 @@ class TestMaxQuestions:
         with Session() as session:
             with patch(RETRIEVE_PATCH, return_value=_make_mock_analogues()), \
                  patch(SYNTHESIZE_PATCH, return_value=_mock_prediction_result()):
-                result = run_offline_loop(config, session, MagicMock(), MagicMock())
+                result = run_offline_loop(config, session, MagicMock(), MagicMock(), _worker_session_factory=Session)
 
         assert result.n_predictions == 2
 
@@ -347,7 +371,7 @@ class TestMaxQuestions:
         with Session() as session:
             with patch(RETRIEVE_PATCH, return_value=_make_mock_analogues()), \
                  patch(SYNTHESIZE_PATCH, return_value=_mock_prediction_result()):
-                result = run_offline_loop(config, session, MagicMock(), MagicMock())
+                result = run_offline_loop(config, session, MagicMock(), MagicMock(), _worker_session_factory=Session)
 
         assert result.n_predictions == 1
 
@@ -369,7 +393,7 @@ class TestMeanBrierScore:
         with Session() as session:
             with patch(RETRIEVE_PATCH, return_value=_make_mock_analogues()), \
                  patch(SYNTHESIZE_PATCH, return_value=_mock_prediction_result()):
-                result = run_offline_loop(config, session, MagicMock(), MagicMock())
+                result = run_offline_loop(config, session, MagicMock(), MagicMock(), _worker_session_factory=Session)
 
         assert result.mean_brier_score is not None
         assert abs(result.mean_brier_score - 0.25) < 1e-9
@@ -389,7 +413,7 @@ class TestMeanBrierScore:
         with Session() as session:
             with patch(RETRIEVE_PATCH, return_value=_make_mock_analogues()), \
                  patch(SYNTHESIZE_PATCH, return_value=_mock_prediction_result()):
-                result = run_offline_loop(config, session, MagicMock(), MagicMock())
+                result = run_offline_loop(config, session, MagicMock(), MagicMock(), _worker_session_factory=Session)
 
         # Both have brier=0.25, so mean=0.25
         assert result.mean_brier_score is not None
@@ -405,7 +429,7 @@ class TestMeanBrierScore:
         with Session() as session:
             with patch(RETRIEVE_PATCH, return_value=_make_mock_analogues()), \
                  patch(SYNTHESIZE_PATCH, return_value=_mock_prediction_result()):
-                result = run_offline_loop(config, session, MagicMock(), MagicMock())
+                result = run_offline_loop(config, session, MagicMock(), MagicMock(), _worker_session_factory=Session)
 
         assert result.mean_brier_score is None
         assert result.n_predictions == 0
@@ -423,7 +447,7 @@ class TestMeanBrierScore:
         with Session() as session:
             with patch(RETRIEVE_PATCH, return_value=_make_mock_analogues()), \
                  patch(SYNTHESIZE_PATCH, return_value=_mock_prediction_result()):
-                result = run_offline_loop(config, session, MagicMock(), MagicMock())
+                result = run_offline_loop(config, session, MagicMock(), MagicMock(), _worker_session_factory=Session)
 
         assert result.completed_at is not None
 
@@ -444,7 +468,7 @@ class TestCostUsd:
         with Session() as session:
             with patch(RETRIEVE_PATCH, return_value=_make_mock_analogues()), \
                  patch(SYNTHESIZE_PATCH, return_value=_mock_prediction_result()):
-                result = run_offline_loop(config, session, MagicMock(), MagicMock())
+                result = run_offline_loop(config, session, MagicMock(), MagicMock(), _worker_session_factory=Session)
 
         # dry_run returns tokens_used=0, so cost_usd should be 0.0
         assert result.cost_usd is not None
@@ -471,7 +495,7 @@ class TestCostUsd:
         with Session() as session:
             with patch(RETRIEVE_PATCH, return_value=_make_mock_analogues()), \
                  patch(SYNTHESIZE_PATCH, return_value=expensive_result):
-                result = run_offline_loop(config, session, MagicMock(), MagicMock())
+                result = run_offline_loop(config, session, MagicMock(), MagicMock(), _worker_session_factory=Session)
 
         assert result.cost_usd is not None
         assert result.cost_usd >= 0.0
@@ -485,8 +509,70 @@ class TestCostUsd:
         config = _make_config(dry_run=True)
 
         with Session() as session:
-            result = run_offline_loop(config, session, MagicMock(), MagicMock())
+            result = run_offline_loop(config, session, MagicMock(), MagicMock(), _worker_session_factory=Session)
 
         assert result.cost_usd is not None
         assert result.cost_usd >= 0.0
         assert result.cost_usd == 0.0
+
+
+class TestMLPredictorRouting:
+    """Verify analogue_aggregator predictor_type bypasses synthesize_prediction."""
+
+    def test_analogue_aggregator_does_not_call_synthesize(self):
+        engine = _make_engine()
+        Session = _make_session_factory(engine)
+
+        with Session() as session:
+            session.add(_make_question(id="q1", resolution_value=1.0))
+            session.commit()
+
+        config = _make_config(predictor_type="analogue_aggregator")
+        synth_mock = MagicMock()
+
+        with Session() as session:
+            with patch(RETRIEVE_PATCH, return_value=_make_mock_analogues()), \
+                 patch(SYNTHESIZE_PATCH, synth_mock):
+                result = run_offline_loop(config, session, MagicMock(), MagicMock(), _worker_session_factory=Session)
+
+        synth_mock.assert_not_called()
+        assert isinstance(result, RunResult)
+        assert result.n_predictions == 1
+
+    def test_analogue_aggregator_cost_is_zero(self):
+        engine = _make_engine()
+        Session = _make_session_factory(engine)
+
+        with Session() as session:
+            for i in range(3):
+                session.add(_make_question(id=f"q{i}", resolution_value=1.0))
+            session.commit()
+
+        config = _make_config(predictor_type="analogue_aggregator")
+
+        with Session() as session:
+            with patch(RETRIEVE_PATCH, return_value=_make_mock_analogues()):
+                result = run_offline_loop(config, session, MagicMock(), MagicMock(), _worker_session_factory=Session)
+
+        assert result.cost_usd == pytest.approx(0.0)
+
+    def test_analogue_aggregator_features_stored_on_prediction(self):
+        engine = _make_engine()
+        Session = _make_session_factory(engine)
+
+        with Session() as session:
+            session.add(_make_question(id="q1", resolution_value=1.0))
+            session.commit()
+
+        config = _make_config(predictor_type="analogue_aggregator")
+
+        with Session() as session:
+            with patch(RETRIEVE_PATCH, return_value=_make_mock_analogues()):
+                result = run_offline_loop(config, session, MagicMock(), MagicMock(), _worker_session_factory=Session)
+            run_id = result.id
+
+        from src.db.models import Prediction as PredModel
+        with Session() as session:
+            pred = session.query(PredModel).filter_by(run_id=run_id).first()
+            # features may be None (no labeled analogues in stubs) but column must exist
+            assert hasattr(pred, "features")

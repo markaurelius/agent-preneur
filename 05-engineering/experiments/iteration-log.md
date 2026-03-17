@@ -19,6 +19,32 @@
 
 ---
 
+### Iteration 29 — Row+feature subsampling (subsample=0.8, colsample_bytree=0.8) — 2026-03-17
+
+**Change:** Added `subsample=0.8, subsample_freq=1, colsample_bytree=0.8` to fold training in `backtest_stocks.py`.
+
+**Before:** 0.2354 (iter 27)
+**After:** 0.2386
+**Delta:** +0.0032 (regression)
+**Result:** REVERTED
+
+**Post-mortem:** Bagging helped 2024 fold (0.2168→0.2107) but hurt 2021 (0.2573→0.2621), 2022 (0.2577→0.2642), and 2023 (0.2096→0.2175). The 2022 fold regression with both subsampling and min_child_samples=20 suggests the 2022 fold has a fundamental issue: energy_x_cpi and FRED interaction features have OOD (out-of-distribution) values in 2022 (CPI=7.56 vs max 2.60 in training 2018-2021), potentially causing the model to extrapolate incorrectly for 2022 energy stocks.
+
+---
+
+### Iteration 28 — min_child_samples=10 (compromise test) — 2026-03-17
+
+**Change:** Tested `min_child_samples=10` as a compromise between 5 (baseline) and 20 (iter 27 best).
+
+**Before:** 0.2354 (iter 27)
+**After:** 0.2435
+**Delta:** +0.0081 (regression)
+**Result:** REVERTED
+
+**Post-mortem:** Non-monotonic: min_child_samples=10 is WORSE than both 5 (~0.2373) and 20 (0.2354). 2022 fold particularly bad (0.2617). The model benefits from either fine-grained splits (=5) or strong regularization (=20), but not the intermediate. Keeping iter 27's =20 setting.
+
+---
+
 ### Iteration 27 — min_child_samples 5→20 in fold training — 2026-03-17
 
 **Change:** Increased `min_child_samples` from 5 to 20 in `backtest_stocks.py`'s per-fold LightGBM training.

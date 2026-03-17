@@ -229,7 +229,532 @@ Context: data-plan.md §Data Infrastructure; Jupyter; pandas; matplotlib
 
 ---
 
-## Parallel Tracks Summary
+---
+
+---
+# ML / Finance Improvement Ideas
+
+> Status: `idea` = proposed, not triaged | `todo` = approved, ready to implement | `done` = shipped
+> Agent routing: ML changes → `ml-specialist` | Signal/finance ideas → `finance-specialist` | Data sources → `data-corpus`
+> Run `/build [task-name]` to implement any task.
+
+---
+
+## MACRO-01: FRED continuous macro integration
+Discipline: data
+Status: todo
+Agent: data-corpus → ml-specialist
+Depends on: none (standalone data fetch)
+Priority: HIGH — highest-leverage single change remaining
+
+### What to build
+Replace the 4 binary macro flags (`macro_bull`, `macro_bear`, `macro_rate_rising`, `macro_rate_falling`)
+with 5 continuous FRED signals fetched at Jan 1 of each snapshot year.
+
+FRED series (all free, no auth for basic access):
+- `T10Y2Y` — 10Y−2Y yield curve slope (negative = recession risk)
+- `FEDFUNDS` — Fed funds rate level (cost of capital, multiple compression)
+- `BAMLH0A0HYM2` — HY credit spread (risk appetite; high = equity bearish)
+- `VIXCLS` — VIX level (fear/mean-reversion signal)
+- `CPIAUCSL` — CPI YoY change (inflation shock → sector rotation)
+
+Implementation:
+1. `data-corpus` agent: add `_fetch_fred_year_snapshot(year)` to `src/ingestion/fundamentals.py::fetch_macro_regime()`
+2. Cache FRED values in a `fred_macro` table (year → 5 floats) to avoid re-fetching
+3. `ml-specialist` agent: update `STOCK_FEATURE_NAMES` in `stock_features.py`, re-fetch all snapshots, run `make iterate`
+
+Why it matters:
+- Binary flags don't capture magnitude: "mildly rising rates" vs "fastest rate hike in 40 years" are treated identically
+- T10Y2Y was negative in Jan 2022 (−0.05%) → strong recession signal that model currently misses
+- HY spreads spiked in 2022; model has no way to encode credit risk appetite
+- Re-fetching isn't required — can add FRED values as a join at training time using snapshot year
+
+### Done when
+- All 8 training years (2018–2025) have FRED values cached
+- `make iterate` shows Brier change vs Iteration 8 baseline (0.2493 CV)
+- Feature importances show at least one FRED signal in top-10
+
+---
+
+## MACRO-02: Sector × macro interaction features
+Discipline: ml
+Status: idea
+Agent: finance-specialist → ml-specialist
+Depends on: MACRO-01
+
+### What to build
+Explicit interaction terms between sector flags and macro regime:
+- `energy_x_rate_rising` = sector_energy × (1 if rate_rising else 0)
+- `tech_x_rate_rising` = sector_technology × (1 if rate_rising else 0)
+- `financials_x_rate_rising` = sector_financials × (1 if rate_rising else 0)
+- `beta_x_macro_bear` = beta × macro_bear (continuous, after MACRO-01)
+
+Why: LightGBM can learn interactions through tree splits, but explicit terms help with small data.
+2022 root cause: energy sector + rising rates = positive (not negative like other sectors).
+Model had macro_bear=1 for 2022 but couldn't see that energy was the exception.
+
+### Done when
+- One `make iterate` cycle with interaction terms added
+- 2022 fold Brier improves vs Iteration 7 (0.3209)
+
+---
+
+## MACRO-03: Defense sector sub-flag
+Discipline: finance
+Status: idea
+Agent: finance-specialist → ml-specialist
+Depends on: none
+
+### What to build
+RTX, LMT, NOC, GD behave like "Defense" (government contracts, countercyclical to geopolitical risk)
+but are classified as "Industrials" by yfinance. Add a `sector_defense` flag for these tickers.
+
+Tickers to sub-classify: RTX, LMT, NOC, GD, BA (commercial + defense), HII, L3H
+In `_SECTOR_FLAG_MAP` in `stock_features.py`, add a lookup that overrides yfinance sector for known defense tickers.
+
+Why: RTX had beta=0.406 and was classified industrials/macro_bear → prob=0.22 in our backtest.
+RTX 2022 actual = +18.9% outperformance (Ukraine war driven). A defense flag would have helped.
+
+### Done when
+- Defense tickers use `sector_defense` flag in feature extraction
+- One `make iterate` cycle; check RTX/LMT probability direction in 2022 fold
+
+---
+
+## MODEL-01: Hyperparameter grid search
+Discipline: ml
+Status: idea
+Agent: ml-specialist
+Depends on: MACRO-01 (more features = more to tune)
+Priority: MEDIUM — only worthwhile with ≥500 training samples per fold (we now have 561/fold)
+
+### What to build
+`scripts/hparam_search.py` — grid search over LightGBM params using walk-forward CV:
+```
+num_leaves:       [15, 31, 63]
+n_estimators:     [100, 200, 400]
+feature_fraction: [0.7, 0.8, 0.9]   # column subsampling
+min_child_samples:[5, 10, 20]         # regularization
+learning_rate:    [0.05, 0.1]
+```
+Use `make hparam-search` target. Report top-5 configs by mean CV Brier.
+Lock down: run on training years only (2018–2024); never use 2025 fold for param selection.
+
+### Done when
+- Grid search identifies a config with CV Brier improvement of ≥0.005 vs current defaults
+- Best config written to `experiments/stock-ml.yaml` for use in `make iterate`
+
+---
+
+## MODEL-02: Ensemble — blend LightGBM with logistic regression
+Discipline: ml
+Status: idea
+Agent: ml-specialist
+Depends on: MODEL-01
+
+### What to build
+A simple ensemble: average probabilities from two models trained on same walk-forward folds:
+1. Current LightGBM + CalibratedClassifierCV(isotonic)
+2. Logistic regression with L1 regularization (interpretable, stable on small data)
+
+Blend weight: start at 50/50; tune via CV.
+Why: logistic regression acts as a regularizer — it can't overfit interactions the way LightGBM can.
+When the two models disagree strongly, that's a signal of high uncertainty (useful for confidence intervals).
+
+### Done when
+- Ensemble CV Brier ≤ better of the two individual models
+- Disagreement signal correlates with actual prediction uncertainty
+
+---
+
+## MODEL-03: SHAP explainability for individual predictions
+Discipline: ml
+Status: idea
+Agent: ml-specialist
+Depends on: none
+
+### What to build
+Add SHAP values to the forecast output. For each ticker, show which features drove the prediction:
+```
+ORCL  prob=77.8%
+  momentum_12_1   +0.18  (strong recent momentum)
+  sector_tech     +0.09
+  beta            +0.07  (high beta in bull market)
+  debt_to_equity  -0.03
+```
+Use `shap` library (already installable via pip). `TreeExplainer` works with LightGBM.
+Output as a second section in `make forecast-stocks-ml`.
+
+### Done when
+- Top-3 contributing features shown per ticker in forecast output
+- SHAP values sum to approximately (prob − base_rate)
+
+---
+
+## MODEL-04: Purged walk-forward CV (embargo periods)
+Discipline: ml
+Status: idea
+Agent: ml-specialist
+Depends on: none
+
+### What to build
+Current walk-forward trains on year Y-1 and tests on year Y. But annual snapshots are
+highly correlated: AAPL fundamentals in 2023 and 2024 share most features. This means
+the train set isn't fully independent of the test set.
+
+Solution: purge the 1-2 years immediately before the test year from training.
+- Test year: 2025
+- Training: 2018–2022 (skip 2023, 2024 as "embargo")
+
+Tradeoff: smaller train set, but less overfitting to recent regime that just ended.
+
+### Done when
+- Purged CV Brier compared to standard walk-forward CV
+- If purged CV is lower, adopt as default; if higher, document why and keep standard
+
+---
+
+## DATA-01: Expand ticker universe to full S&P 500
+Discipline: data
+Status: idea
+Agent: data-corpus
+Depends on: none (can run in background)
+Priority: MEDIUM — more data = more robust model
+
+### What to build
+Currently using `SP500_EXTENDED` (~187 tickers). Full S&P 500 has ~500 tickers.
+Add `SP500_PHASE3` list in `src/ingestion/fundamentals.py` (next ~313 tickers by market cap).
+Run `make fetch-snapshots-extended YEARS=2018-2025 TICKERS=SP500_PHASE3`.
+
+Training samples at full S&P 500: ~500 × 8 = 4,000 (vs current 1,492).
+With 4,000 samples, `num_leaves=63` and deeper trees become viable without overfitting.
+
+### Done when
+- DB has ≥4,000 snapshots covering 2018–2025
+- `make iterate` run with full universe; CV Brier reported
+
+---
+
+## DATA-02: EDGAR XBRL for historical fundamentals (pre-2018)
+Discipline: data
+Status: idea
+Agent: data-corpus
+Depends on: none
+
+### What to build
+yfinance `.financials` is unreliable before ~2018. PE ratio is null for 2018-2022 snapshots
+in our current training data. SEC EDGAR XBRL API provides standardized 10-K data from 2009+.
+
+`scripts/fetch_edgar_fundamentals.py`:
+- CIK lookup: `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&company={ticker}&type=10-K`
+- Data: `https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json`
+- Extract: revenue, net income, gross profit, total assets, long-term debt per fiscal year
+- Store in `edgar_fundamentals` table; join to `stock_snapshots` at training time
+
+Why: PE ratio is currently null for early years. Model trains without valuation signals for 6 of 8 years.
+EDGAR data would give us consistent fundamentals across all years and let us extend to 2015+.
+
+### Done when
+- `edgar_fundamentals` table populated for SP500_EXTENDED tickers, 2015–2023
+- PE ratio non-null rate in snapshots improves from ~25% to >80%
+
+---
+
+## DATA-03: SimFin earnings estimates
+Discipline: data
+Status: idea
+Agent: data-corpus
+Depends on: none
+
+### What to build
+SimFin free tier provides forward EPS growth estimates — a signal not available in yfinance.
+`earnings_growth_estimate`: analyst consensus forward EPS growth %
+
+Why: `earnings_rev_up/down` is currently always "neutral" in historical backtest because
+yfinance doesn't provide historical analyst revision data. SimFin fills this gap.
+
+### Done when
+- `earnings_growth_fwd` field populated in snapshots for ≥80% of tickers
+- One `make iterate` cycle shows feature importance contribution
+
+---
+
+## SIGNAL-01: Free cash flow yield
+Discipline: finance
+Status: idea
+Agent: finance-specialist → ml-specialist
+Depends on: none
+
+### What to build
+FCF yield = free cash flow / market cap. A quality-value hybrid:
+- High FCF yield = cash generative business at reasonable price
+- Low FCF yield = growth stock or capital-intensive business
+- Available from yfinance: `info.freeCashflow` / `info.marketCap`
+
+Finance rationale: FCF yield is one of the most predictive single factors in academic literature
+(Fama-French quality factor). High FCF companies tend to outperform in late-cycle environments
+when growth stocks are penalized by rising rates.
+
+### Done when
+- `fcf_yield` in `STOCK_FEATURE_NAMES`; non-null for ≥70% of tickers
+- Feature importance checked after one `make iterate` cycle
+
+---
+
+## SIGNAL-02: Price-to-book ratio
+Discipline: finance
+Status: idea
+Agent: finance-specialist → ml-specialist
+Depends on: none
+
+### What to build
+P/B ratio from `info.priceToBook`. Classic Fama-French value factor.
+Low P/B = asset-heavy value; high P/B = intangible/growth.
+Complements P/E: some high-P/E stocks have low P/B (asset-light but profitable).
+
+Finance rationale: P/E alone misses book value — financials and energy often trade at low P/B
+even with moderate P/E. Useful for distinguishing value banks from growth fintechs.
+
+### Done when
+- `price_to_book` in `STOCK_FEATURE_NAMES`; tested in one iteration
+
+---
+
+## SIGNAL-03: Revenue growth acceleration (QoQ trend)
+Discipline: finance
+Status: idea
+Agent: finance-specialist → ml-specialist
+Depends on: DATA-02 or DATA-03
+
+### What to build
+Not just TTM revenue growth, but whether growth is accelerating or decelerating:
+`revenue_accel` = current_quarter_growth − prior_quarter_growth
+
+Why: A company growing at 15% that accelerated from 10% is a different signal than
+one that decelerated from 20%. Acceleration is a momentum signal at the fundamental level.
+Requires quarterly data (available from yfinance `.quarterly_financials`).
+
+### Done when
+- `revenue_accel` added to features
+- Tested in one `make iterate` cycle
+
+---
+
+## SIGNAL-04: Insider buying signal
+Discipline: finance
+Status: idea
+Agent: finance-specialist → ml-specialist
+Depends on: new data source (SEC Form 4)
+
+### What to build
+SEC Form 4 filings report insider buys/sells within 2 business days. A net insider buying
+signal is one of the few truly non-public signals that is legally accessible.
+
+Data source: OpenInsider (`https://openinsider.com/screener`) or SEC EDGAR Form 4.
+`insider_buy_score` = ($ bought − $ sold) / market cap over trailing 90 days
+
+Finance rationale: insiders have information advantage on their own company. Clustered
+buying by multiple insiders (not one person) is a strong signal. Most effective for small/mid
+caps; less signal in mega-caps (insiders sell for diversification).
+
+Caveat: harder to backtest (Form 4 data available but requires assembly).
+
+### Done when
+- Form 4 data fetched and `insider_buy_score` computed for ≥50% of tickers
+- Backtest shows feature contributes meaningful importance
+
+---
+
+## SIGNAL-05: Short interest change (delta, not level)
+Discipline: finance
+Status: idea
+Agent: finance-specialist → ml-specialist
+Depends on: none
+
+### What to build
+We already have `short_pct_float` (level). Add `short_interest_change`:
+`short_delta` = current_short_pct − prior_month_short_pct
+
+Why: direction matters as much as level. A stock with 15% short interest that just
+dropped from 25% is a very different signal than one rising from 5%.
+Short covering = forced buying = price catalyst.
+
+Available: yfinance `info.shortPercentOfFloat` (current); historical from FINRA biweekly.
+
+### Done when
+- `short_delta` field added; tested in one cycle
+
+---
+
+## SIGNAL-06: 52-week momentum with sector conditioning
+Discipline: finance
+Status: idea
+Agent: finance-specialist → ml-specialist
+Depends on: MACRO-01 (needs continuous macro regime)
+
+### What to build
+We removed `price_vs_52w_high` / `price_vs_52w_low` in Iteration 3 because they caused
+regime-change mispredictions. But the error was unconditional use — momentum is a valid
+factor conditioned on regime.
+
+Proposal: re-introduce momentum, but multiply by (1 − macro_bear_intensity):
+`conditioned_momentum` = momentum_12_1 × max(0, 1 − hy_spread_percentile)
+
+Where `hy_spread_percentile` comes from FRED MACRO-01. When credit spreads are high
+(stress regime), momentum is discounted. When credit spreads are low (calm market), momentum gets full weight.
+
+### Done when
+- Conditioned momentum replaces or supplements raw `momentum_12_1`
+- 2022 fold Brier improvement (reduced momentum trap on stress-regime misclassification)
+
+---
+
+## SIGNAL-07: Options market signals (put/call skew)
+Discipline: finance
+Status: idea
+Agent: finance-specialist
+Depends on: new data source (options data)
+
+### What to build
+Options market participants are often more informed than equity market participants.
+`put_call_skew` = implied vol of 30-delta put − implied vol of 30-delta call (at same expiry)
+
+High put/call skew = options market is pricing in downside risk that equity price hasn't yet reflected.
+
+Data source: yfinance provides options chains (`ticker.option_chain(date)`). IV can be computed
+from Black-Scholes. Historical options data is harder — CBOE provides some, ORATS/OptionMetrics
+for full history (paid).
+
+Note: available for current forecasting easier than backtesting. Good for live 2026 signal enrichment
+before full historical data is assembled.
+
+### Done when
+- `put_call_skew` computed for TOP_50 tickers in current (2026) forecast
+- Verified to contribute to divergence from analyst consensus
+
+---
+
+## SIGNAL-08: Earnings quality — accruals ratio
+Discipline: finance
+Status: idea
+Agent: finance-specialist → ml-specialist
+Depends on: DATA-02 (EDGAR for historical balance sheet)
+
+### What to build
+Accruals ratio = (net income − operating cash flow) / total assets
+Low accruals (earnings backed by cash) = high quality. High accruals = accounting-driven earnings.
+
+Finance rationale: Richardson et al. (2005) showed high-accrual firms subsequently underperform.
+Companies that report profits mainly through accruals (not cash) tend to revert.
+
+Particularly useful for: pharma (milestone recognition), tech (deferred revenue), financials.
+
+### Done when
+- `accruals_ratio` computed from EDGAR or yfinance `.cashflow` data
+- Tested in one iteration; finance-specialist reviews which sectors show strongest signal
+
+---
+
+## ENGG-01: Feature name warning fix
+Discipline: ml
+Status: todo
+Agent: ml-specialist
+Depends on: none
+Priority: LOW (cosmetic, predictions are correct)
+
+### What to build
+The saved model `lgbm_stock_v1.pkl` was trained without DataFrame feature names, but inference
+now passes named DataFrames → 250 sklearn warnings per forecast run.
+
+Fix: retrain and save model passing `pd.DataFrame` (not numpy array) to `.fit()`.
+This happens automatically on next `make iterate` — just need to confirm the warning is gone.
+
+### Done when
+- `make forecast-stocks-ml` produces 0 feature-name warnings
+
+---
+
+## ENGG-02: Clean up stocks.db
+Discipline: devops
+Status: todo
+Agent: devops
+Depends on: none
+Priority: LOW
+
+### What to build
+`data/stocks.db` is an empty file created accidentally. `DATABASE_URL` correctly points to
+`engine.db`, but `stocks.db` causes confusion when inspecting the data directory.
+Delete the file. Optionally add a comment in `docker-compose.yml` noting `DATABASE_URL`.
+
+### Done when
+- `stocks.db` does not exist in `data/`
+- `docker compose run engine sqlite3 data/engine.db ".tables"` confirms engine.db is unchanged
+
+---
+
+## ENGG-03: Fast simulation loop (Monte Carlo uncertainty)
+Discipline: ml
+Status: idea
+Agent: ml-specialist
+Depends on: none
+
+### What to build
+Current model returns a single probability estimate. Add uncertainty quantification:
+- Train 10 LightGBM models with different random seeds on each walk-forward fold
+- At inference: return mean + stddev across the 10 models
+- `uncertainty = stddev / 0.5` — stocks with high uncertainty get flagged
+
+Why: calibrated uncertainty matters for position sizing. A stock at 70% prob with
+σ=5% is a very different bet than 70% prob with σ=20%. The latter might be a model
+disagreement case (feature information is contradictory).
+
+Output: `make forecast-stocks-ml` shows confidence interval, not just point estimate.
+
+### Done when
+- 10-model ensemble trained; forecast shows `prob ± 1σ` for each ticker
+- High-uncertainty stocks (σ > 15%) flagged separately
+
+---
+
+## ENGG-04: Experiment comparison CLI
+Discipline: data
+Status: todo
+Agent: data-eng
+Depends on: none
+
+### What to build
+`scripts/compare_iterations.py` — compare two backtest runs by iteration log entry:
+- Parse `experiments/iteration-log.md` to extract Brier by year per iteration
+- Print side-by-side table: ticker, year, prob_before, prob_after, Brier_before, Brier_after, delta
+- Highlight regressions (Brier got worse) in one color, improvements in another
+
+This would have caught the MACRO-02 AMD/IBM regression in Iteration 7 automatically.
+
+### Done when
+- `python scripts/compare_iterations.py 6 7` prints the per-ticker comparison
+- Regressions are clearly marked
+
+---
+
+## ENGG-05: `make iterate` timing instrumentation
+Discipline: devops
+Status: idea
+Agent: devops
+
+### What to build
+Add timing to the Makefile targets:
+- `make fetch-snapshots-extended` → log time per ticker, total time, errors/retries
+- `make iterate` → log CV fold times, which fold is slowest
+- Identify if the bottleneck is data fetching, training, or evaluation
+
+Currently the iteration loop has no timing — it's hard to know if a 3-minute run is fast or slow.
+
+### Done when
+- `make iterate` prints: "CV fold 2025: 4.2s | Backtest: 1.8s | Total: 6.0s"
+
+---
+
+## ## Parallel Tracks Summary
 
 ```
 docker-setup

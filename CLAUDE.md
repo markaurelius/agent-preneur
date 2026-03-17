@@ -14,6 +14,37 @@
 
 ---
 
+## Autonomous Agent Mode
+
+When running inside Docker as the autonomous agent (via `make agent`), follow the
+protocol in `05-engineering/AGENT_TASK.md`. Key differences from interactive mode:
+
+### Use `make agent-iterate` (not `make iterate`)
+Inside the agent container there is no Docker socket — run Python scripts directly:
+```
+make agent-iterate    # train + backtest + results (direct Python)
+make agent-results    # results summary only
+```
+
+### Notification triggers
+Use `python scripts/notify.py` for all user communication:
+- **Before every iteration**: summary of what you're about to try
+- **After 5 iterations**: checkpoint message, then exit
+- **On 3 consecutive regressions**: urgent stop message, then exit
+- **On any true blocker**: describe the blocker, then exit
+
+### Git workflow (agent mode)
+- Always start from `main`
+- Branch per iteration: `iter-N-<slug>`
+- Push on improvement; delete branch and stay on main on regression
+- Never commit to main directly
+
+### Coexistence with interactive mode
+The agent uses `docker-compose.agent.yml`; interactive dev uses `docker-compose.yml`.
+**Do not run both simultaneously** — they share `./data/engine.db`.
+
+---
+
 ## Active Workflows
 
 ### Fast iteration loop (seconds per cycle, no network after step 0)

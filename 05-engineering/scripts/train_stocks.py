@@ -82,6 +82,7 @@ def main() -> None:
 
     from src.db.models import StockSnapshot
     from src.db.session import get_session
+    from src.ingestion.fundamentals import load_fred_macro_from_db
     from src.synthesis.stock_features import STOCK_FEATURE_NAMES, extract_stock_features, features_to_vector
 
     # -----------------------------------------------------------------------
@@ -100,6 +101,21 @@ def main() -> None:
 
         rows = query.all()
 
+        # Load FRED macro once inside the session so continuous signals override
+        # the old binary-only macro_regime JSON stored in snapshot_json.
+        fred_by_year = load_fred_macro_from_db(session)
+
+    if fred_by_year:
+        logger.info(
+            "FRED macro loaded: %d years cached (%s)",
+            len(fred_by_year), sorted(fred_by_year.keys()),
+        )
+    else:
+        logger.warning(
+            "fred_macro table is empty — FRED signals will use neutral defaults. "
+            "Run 'make populate-fred' to populate."
+        )
+
     if not rows:
         logger.error(
             "No cached snapshots found. Run 'make fetch-snapshots' first."
@@ -113,6 +129,13 @@ def main() -> None:
         sorted(set(r.year for r in rows)),
     )
 
+    def _snap_with_fred(snap: dict, yr: int) -> dict:
+        """Return snapshot with FRED macro injected if available for year."""
+        if yr in fred_by_year:
+            snap = dict(snap)  # shallow copy — never mutate the DB object
+            snap["macro_regime"] = fred_by_year[yr]
+        return snap
+
     # -----------------------------------------------------------------------
     # Build feature matrix
     # -----------------------------------------------------------------------
@@ -122,7 +145,10 @@ def main() -> None:
             "year": r.year,
             # Re-extract from snapshot_json so any new features in extract_stock_features
             # are included without needing to re-fetch from yfinance.
-            "vec": features_to_vector(extract_stock_features(r.snapshot_json)),
+            # Inject FRED continuous macro signals (yield_curve_slope, fed_funds_rate,
+            # hy_spread, vix, cpi_yoy) so the model trains on real values rather than
+            # the neutral defaults that were stored in snapshot_json.
+            "vec": features_to_vector(extract_stock_features(_snap_with_fred(r.snapshot_json, r.year))),
             "label": float(r.label),
         }
         for r in rows
@@ -150,20 +176,21 @@ def main() -> None:
     if len(sorted_years) > wf_window:
         test_years = sorted_years[wf_window:]
         logger.info(
-            "Walk-forward CV: window=%d years | test folds: %s", wf_window, test_years
+            "Walk-forward CV: expanding window (all years from earliest) | test folds: %s", test_years
         )
 
         for test_year in test_years:
-            train_years = [y for y in sorted_years if y < test_year][-wf_window:]
+            train_years = [y for y in sorted_years if y < test_year]  # expanding window from earliest year
             train_data = [d for d in data if d["year"] in train_years]
             test_data = [d for d in data if d["year"] == test_year]
 
             if not train_data or not test_data:
                 continue
 
-            X_tr = np.array([d["vec"] for d in train_data])
+            import pandas as pd
+            X_tr = pd.DataFrame([d["vec"] for d in train_data], columns=STOCK_FEATURE_NAMES)
             y_tr = np.array([d["label"] for d in train_data])
-            X_te = np.array([d["vec"] for d in test_data])
+            X_te = pd.DataFrame([d["vec"] for d in test_data], columns=STOCK_FEATURE_NAMES)
             y_te = [d["label"] for d in test_data]
 
             # Compute class weight for this fold
@@ -217,7 +244,8 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # Train final model on all data
     # -----------------------------------------------------------------------
-    X_all = np.array([d["vec"] for d in data])
+    import pandas as pd
+    X_all = pd.DataFrame([d["vec"] for d in data], columns=STOCK_FEATURE_NAMES)
     y_all = np.array([d["label"] for d in data])
 
     logger.info("Fitting final model on %d examples …", len(X_all))

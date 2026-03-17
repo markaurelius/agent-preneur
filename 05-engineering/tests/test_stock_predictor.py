@@ -139,7 +139,7 @@ class TestStockMLPredictor:
         assert predictor is not None
 
     def test_predict_returns_prediction_result(self, model_path):
-        from src.synthesis.predictor import PredictionResult
+        from src.synthesis.prediction_result import PredictionResult
 
         predictor = StockMLPredictor(model_path)
         result = predictor.predict(_FULL_SNAPSHOT)

@@ -155,6 +155,40 @@ def _momentum_from_prices(price_df, ticker: str, year: int) -> float | None:
         return None
 
 
+def _momentum_3_1_from_prices(price_df, ticker: str, year: int) -> float | None:
+    """Compute 3-month short-term momentum as of Jan 1 of year from bulk price DataFrame.
+
+    Uses the same convention as _momentum_from_prices: price_3m_ago / price_now - 1.
+    A negative value means the stock has risen over the last 3 months (consistent
+    with momentum_12_1 sign convention in this codebase).
+    For momentum_decel = momentum_12_1 - momentum_3_1:
+      - If both are negative at similar levels → steady trend
+      - If momentum_12_1 is more negative (stronger LT rise) but momentum_3_1 is
+        near zero or positive → stock is "rolling over" (recent price decline)
+    """
+    try:
+        import pandas as pd
+        col = _get_close_series(price_df, ticker)
+        if col is None or col.empty:
+            return None
+        # ref_date = Jan 1 of the snapshot year
+        ref_date = pd.Timestamp(f"{year}-01-01")
+        date_3m = ref_date - pd.DateOffset(months=3)
+        # Find closest available prices on or after each target date
+        after_3m = col[col.index >= date_3m]
+        after_now = col[col.index >= ref_date]
+        if after_3m.empty or after_now.empty:
+            return None
+        p_3m = float(after_3m.iloc[0])
+        p_now = float(after_now.iloc[0])
+        if p_now <= 0:
+            return None
+        # Same formula as momentum_12_1: old_price / recent_price - 1
+        return round((p_3m / p_now - 1) * 100, 2)
+    except Exception:
+        return None
+
+
 def _fetch_ticker_fundamentals(ticker: str, years: list[int]) -> dict:
     """Fetch per-ticker fundamentals (financials, sector, info).
 
@@ -381,6 +415,7 @@ def main() -> None:
                 current_price = _price_at_year_start(price_df, ticker, year)
                 high_52w, low_52w = _52w_range_from_prices(price_df, ticker, year)
                 momentum = _momentum_from_prices(price_df, ticker, year)
+                momentum_3_1 = _momentum_3_1_from_prices(price_df, ticker, year)
 
                 # Fundamentals for this year
                 fd = (fund.get("fundamentals_by_year") or {}).get(year, {})
@@ -409,6 +444,7 @@ def main() -> None:
                     "price_52w_low": low_52w,
                     "analyst_count": 0,
                     "momentum_12_1": momentum,
+                    "momentum_3_1": momentum_3_1,
                     "earnings_revision": "neutral",
                     "pe_vs_sector": pe_vs_sector,
                     "roe": fd.get("roe"),

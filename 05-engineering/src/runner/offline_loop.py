@@ -17,7 +17,6 @@ from src.ingestion.finance_filter import _is_finance
 from src.retrieval.retriever import retrieve_analogues
 from src.scoring.scorer import ScoreResult, compute_run_stats, score_prediction
 from src.db.session import get_session as _default_get_session
-from src.synthesis.predictor import synthesize_prediction
 from src.synthesis.ml_predictor import AnaloguAggregator, MLPredictor
 
 logger = logging.getLogger(__name__)
@@ -27,7 +26,6 @@ def run_offline_loop(
     config: RunConfig,
     session: Session,
     chroma_client,  # chromadb.ClientAPI
-    anthropic_client,  # anthropic.Anthropic
     _worker_session_factory=None,  # injectable for testing; defaults to get_session
 ) -> RunResult:
     """Run the full offline evaluation loop.
@@ -112,12 +110,10 @@ def run_offline_loop(
     # Initialise the predictor once — thread-safe (stateless after init)
     if config.predictor_type == "analogue_aggregator":
         _predictor = AnaloguAggregator()
-    elif config.predictor_type == "ml":
+    else:
         if not config.model_path:
             raise ValueError("predictor_type='ml' requires model_path in the config")
         _predictor = MLPredictor(config.model_path)
-    else:
-        _predictor = None  # will use synthesize_prediction (Claude)
 
     score_results: list[ScoreResult] = []
     score_lock = Lock()
@@ -142,12 +138,9 @@ def run_offline_loop(
                     )
                 return None
 
-            analogues = retrieve_analogues(question, config, chroma_client, worker_session, anthropic_client)
+            analogues = retrieve_analogues(question, config, chroma_client, worker_session)
 
-            if _predictor is not None:
-                pred_result = _predictor.predict(question, analogues)
-            else:
-                pred_result = synthesize_prediction(question, analogues, config, anthropic_client)
+            pred_result = _predictor.predict(question, analogues)
 
             prediction = Prediction(
                 run_id=run_id,

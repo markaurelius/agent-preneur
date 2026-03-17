@@ -410,77 +410,217 @@ def _build_corpus_event(
 # ---------------------------------------------------------------------------
 
 
-def fetch_macro_regime(year: int | None = None) -> dict:
-    """Return a brief macro regime description for a given year (or current).
+# ---------------------------------------------------------------------------
+# FRED macro regime helpers
+# ---------------------------------------------------------------------------
 
-    Fetches SPY 12-month return and the 10-year Treasury yield (^TNX) as
-    regime proxies.  Returns a dict with:
-        spy_return_pct: float | None
-        rate_env: "rising" | "falling" | "stable" | "unknown"
-        market_trend: "bull" | "bear" | "flat" | "unknown"
-        description: str  (human-readable one-liner for the prompt)
+# In-memory cache so all tickers for the same year share one FRED fetch
+_FRED_CACHE: dict[int | None, dict] = {}
+
+_FRED_BASE_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+
+
+def _fetch_fred_series(series_id: str, obs_date: str | None = None) -> list[tuple[str, float]]:
+    """Fetch a FRED CSV series and return list of (date_str, value) tuples.
+
+    If obs_date is given (YYYY-MM-DD), attempt the vintage_date parameter first;
+    if that fails (some series don't support it), fall back to full-series fetch.
+    Always returns the full list — caller filters by date.
     """
-    try:
-        import yfinance as yf
-    except ImportError:
-        return {"description": "macro regime unknown (yfinance not installed)"}
+    import csv
+    import io
+    import requests
 
-    try:
-        spy = yf.Ticker("SPY")
-        tnx = yf.Ticker("^TNX")
+    def _parse_csv(text: str) -> list[tuple[str, float]]:
+        rows = []
+        reader = csv.reader(io.StringIO(text))
+        next(reader, None)  # skip header
+        for row in reader:
+            if len(row) < 2:
+                continue
+            date_s, val_s = row[0].strip(), row[1].strip()
+            if val_s in (".", "", "NA"):
+                continue
+            try:
+                rows.append((date_s, float(val_s)))
+            except ValueError:
+                continue
+        return rows
 
-        if year is None:
-            # Current: use last 12 months
-            spy_hist = spy.history(period="13mo")
-            tnx_hist = tnx.history(period="13mo")
+    # Try vintage_date first (faster — smaller payload)
+    if obs_date:
+        try:
+            url = f"{_FRED_BASE_URL}?id={series_id}&vintage_date={obs_date}"
+            resp = requests.get(url, timeout=15)
+            if resp.status_code == 200 and resp.text.strip():
+                parsed = _parse_csv(resp.text)
+                if parsed:
+                    return parsed
+        except Exception:
+            pass
+
+    # Fall back to full series
+    url = f"{_FRED_BASE_URL}?id={series_id}"
+    resp = requests.get(url, timeout=15)
+    resp.raise_for_status()
+    return _parse_csv(resp.text)
+
+
+def _last_obs_on_or_before(rows: list[tuple[str, float]], cutoff: str) -> float | None:
+    """Return the value of the last observation on or before cutoff date (YYYY-MM-DD)."""
+    result = None
+    for date_s, val in rows:
+        if date_s <= cutoff:
+            result = val
         else:
-            spy_hist = spy.history(start=f"{year}-01-01", end=f"{year}-12-31")
-            tnx_hist = tnx.history(start=f"{year - 1}-12-01", end=f"{year}-12-31")
+            break
+    return result
 
-        spy_return = None
-        market_trend = "unknown"
-        if spy_hist is not None and not spy_hist.empty and len(spy_hist) >= 2:
-            p_start = float(spy_hist["Close"].iloc[0])
-            p_end = float(spy_hist["Close"].iloc[-1])
-            if p_start > 0:
-                spy_return = round((p_end / p_start - 1) * 100, 1)
-                if spy_return > 10:
-                    market_trend = "bull"
-                elif spy_return < -10:
-                    market_trend = "bear"
-                else:
-                    market_trend = "flat"
 
-        rate_env = "unknown"
-        rate_start = rate_end = None
-        if tnx_hist is not None and not tnx_hist.empty and len(tnx_hist) >= 20:
-            rate_start = float(tnx_hist["Close"].iloc[0])
-            rate_end = float(tnx_hist["Close"].iloc[-1])
-            rate_delta = rate_end - rate_start
-            if rate_delta > 0.5:
-                rate_env = "rising"
-            elif rate_delta < -0.5:
-                rate_env = "falling"
-            else:
-                rate_env = "stable"
+def _fetch_fred_snapshot(year: int | None) -> dict:
+    """Fetch FRED macro indicators as of Jan 1 of year (or current if year is None).
 
-        parts = []
-        if market_trend != "unknown" and spy_return is not None:
-            parts.append(f"S&P 500 {market_trend} ({spy_return:+.1f}%)")
-        if rate_env != "unknown" and rate_end is not None:
-            parts.append(f"10Y Treasury {rate_env} (ended ~{rate_end:.1f}%)")
-        description = "; ".join(parts) if parts else "macro regime data unavailable"
+    Returns continuous signals plus legacy binary flags for backward compat.
+    """
+    import time as _time
 
-        return {
-            "spy_return_pct": spy_return,
-            "rate_env": rate_env,
-            "market_trend": market_trend,
-            "rate_end": rate_end,
-            "description": description,
-        }
+    # Determine the observation cutoff date
+    if year is None:
+        from datetime import date as _date
+        cutoff = str(_date.today())
+        prior_cutoff = None  # used for fed_funds YoY comparison
+        prior_year_cutoff = None
+    else:
+        cutoff = f"{year}-01-01"
+        prior_cutoff = f"{year - 1}-01-01"  # 1 year ago for rate direction
+        prior_year_cutoff = f"{year - 1}-01-01"
+
+    result: dict = {
+        "yield_curve_slope": None,
+        "fed_funds_rate": None,
+        "hy_spread": None,
+        "vix": None,
+        "cpi_yoy": None,
+        "market_trend": "unknown",
+        "rate_env": "unknown",
+    }
+
+    series_map = {
+        "yield_curve_slope": "T10Y2Y",
+        "fed_funds_rate": "FEDFUNDS",
+        "hy_spread": "BAMLH0A0HYM2",
+        "vix": "VIXCLS",
+    }
+
+    prior_fed_funds: float | None = None
+
+    for field, series_id in series_map.items():
+        try:
+            rows = _fetch_fred_series(series_id, obs_date=cutoff)
+            val = _last_obs_on_or_before(rows, cutoff)
+            result[field] = round(val, 4) if val is not None else None
+
+            # For fed_funds rate direction: also grab prior year value
+            if field == "fed_funds_rate" and prior_cutoff and rows:
+                pval = _last_obs_on_or_before(rows, prior_cutoff)
+                prior_fed_funds = round(pval, 4) if pval is not None else None
+
+            _time.sleep(0.5)
+        except Exception as exc:
+            logger.warning("FRED fetch failed for %s: %s", series_id, exc)
+
+    # CPI YoY: need CPIAUCSL for 13 months ending at cutoff
+    try:
+        rows_cpi = _fetch_fred_series("CPIAUCSL", obs_date=cutoff)
+        cpi_now = _last_obs_on_or_before(rows_cpi, cutoff)
+        # 12 months prior
+        if year is None:
+            from datetime import date as _date, timedelta
+            dt = _date.today()
+            prior_dt = _date(dt.year - 1, dt.month, dt.day)
+            cpi_prior_cutoff = str(prior_dt)
+        else:
+            cpi_prior_cutoff = f"{year - 1}-01-01"
+        cpi_prior = _last_obs_on_or_before(rows_cpi, cpi_prior_cutoff)
+        if cpi_now is not None and cpi_prior is not None and cpi_prior != 0:
+            result["cpi_yoy"] = round((cpi_now / cpi_prior - 1) * 100, 2)
+        _time.sleep(0.5)
     except Exception as exc:
-        logger.debug("fetch_macro_regime error: %s", exc)
-        return {"description": "macro regime data unavailable"}
+        logger.warning("FRED fetch failed for CPIAUCSL: %s", exc)
+
+    # Derive legacy binary flags from continuous values
+    yc_slope = result["yield_curve_slope"]
+    hy_val = result["hy_spread"]
+    fed_val = result["fed_funds_rate"]
+
+    # market_trend: bear if hy_spread > 4.5 OR yield_curve_slope < -0.3
+    if hy_val is not None and yc_slope is not None:
+        if hy_val > 4.5 or yc_slope < -0.3:
+            result["market_trend"] = "bear"
+        else:
+            result["market_trend"] = "bull"
+    elif hy_val is not None:
+        result["market_trend"] = "bear" if hy_val > 4.5 else "bull"
+    elif yc_slope is not None:
+        result["market_trend"] = "bear" if yc_slope < -0.3 else "bull"
+
+    # rate_env: compare current fed_funds to prior year
+    if fed_val is not None and prior_fed_funds is not None:
+        if fed_val > prior_fed_funds:
+            result["rate_env"] = "rising"
+        elif fed_val < prior_fed_funds:
+            result["rate_env"] = "falling"
+        else:
+            result["rate_env"] = "stable"
+
+    return result
+
+
+def fetch_macro_regime(year: int | None = None) -> dict:
+    """Return continuous FRED macro signals for a given year (or current).
+
+    If year is None, fetches live current FRED values.
+    If year is an int, fetches FRED values as of Jan 1 of that year.
+
+    Returns dict with:
+        yield_curve_slope : float | None  — T10Y2Y (e.g. -0.05)
+        fed_funds_rate    : float | None  — FEDFUNDS (e.g. 4.33)
+        hy_spread         : float | None  — BAMLH0A0HYM2 (e.g. 3.87)
+        vix               : float | None  — VIXCLS (e.g. 23.1)
+        cpi_yoy           : float | None  — CPIAUCSL YoY % (e.g. 8.2)
+        market_trend      : "bull" | "bear" | "unknown"
+        rate_env          : "rising" | "falling" | "stable" | "unknown"
+    """
+    global _FRED_CACHE
+    if year in _FRED_CACHE:
+        return _FRED_CACHE[year]
+
+    data = _fetch_fred_snapshot(year)
+    _FRED_CACHE[year] = data
+    return data
+
+
+def load_fred_macro_from_db(session) -> dict[int, dict]:
+    """Load all fred_macro rows into a year → macro_dict lookup.
+
+    Used at training/backtest time to inject FRED continuous signals into
+    snapshot dicts before feature extraction, without re-fetching yfinance data.
+    """
+    from src.db.models import FredMacro
+    rows = session.query(FredMacro).all()
+    result = {}
+    for row in rows:
+        result[row.year] = {
+            "yield_curve_slope": row.yield_curve_slope,
+            "fed_funds_rate":    row.fed_funds_rate,
+            "hy_spread":         row.hy_spread,
+            "vix":               row.vix,
+            "cpi_yoy":           row.cpi_yoy,
+            "market_trend":      row.market_trend or "unknown",
+            "rate_env":          row.rate_env or "unknown",
+            "skew":              row.skew,
+        }
+    return result
 
 
 def _fetch_momentum_12_1(ticker_obj) -> float | None:

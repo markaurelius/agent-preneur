@@ -1,0 +1,31 @@
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    env_file: .env
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_REPO=${GITHUB_REPO}
+      - NTFY_TOPIC=${NTFY_TOPIC:-}
+      - FRED_API_KEY=${FRED_API_KEY:-}
+      - DATABASE_URL=sqlite:////workspace/05-engineering/data/engine.db
+      - WHATSAPP_TO=${WHATSAPP_TO:-}
+      # Bridge is in-process — always localhost
+      - WHATSAPP_URL=http://localhost:3000
+
+    volumes:
+      # Full repo for git operations
+      - ..:/workspace
+      # Model artifacts persist across rebuilds
+      - agent_models:/workspace/05-engineering/data/models
+      # WhatsApp session — scan QR once, persists forever
+      # Mounted under agent's home so the non-root user always has write access
+      - whatsapp_auth:/home/agent/auth
+
+    working_dir: /workspace/05-engineering
+
+volumes:
+  agent_models:
+  whatsapp_auth:

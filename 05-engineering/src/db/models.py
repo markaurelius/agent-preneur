@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -134,7 +134,58 @@ class StockSnapshot(Base):
     label: Mapped[float | None] = mapped_column(Float)           # 1.0 = outperformed SPY, 0.0 = not
     stock_return: Mapped[float | None] = mapped_column(Float)    # stock annual return %
     spy_return: Mapped[float | None] = mapped_column(Float)      # SPY annual return %
+    snapshot_date: Mapped[str | None] = mapped_column(String(10), nullable=True)  # YYYY-MM-DD; set by migration 006
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class FredMacro(Base):
+    """FRED macro indicator snapshot keyed by year.
+
+    Populated once by scripts/populate_fred_macro.py for years 2018–2025.
+    Used at training time to inject continuous FRED signals into snapshot dicts
+    without re-fetching all 1,492 historical snapshots.
+    """
+
+    __tablename__ = "fred_macro"
+
+    year: Mapped[int] = mapped_column(Integer, primary_key=True)
+    yield_curve_slope: Mapped[float | None] = mapped_column(Float, nullable=True)
+    fed_funds_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    hy_spread: Mapped[float | None] = mapped_column(Float, nullable=True)
+    vix: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cpi_yoy: Mapped[float | None] = mapped_column(Float, nullable=True)
+    market_trend: Mapped[str | None] = mapped_column(String(16), nullable=True)   # "bull" | "bear"
+    rate_env: Mapped[str | None] = mapped_column(String(16), nullable=True)       # "rising" | "falling" | "stable"
+    skew: Mapped[float | None] = mapped_column(Float, nullable=True)              # CBOE SKEW index (Jan 1 of year)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class EdgarFundamentals(Base):
+    """SEC EDGAR XBRL quarterly/annual financial data for a (ticker, fiscal_year, fiscal_period).
+
+    Fetched once by scripts/fetch_edgar_fundamentals.py.
+    Primary key: f"{ticker}-{fy}-{fp}" (e.g. "AAPL-2022-Q1").
+    Used for quarterly snapshot features in later sessions.
+    """
+
+    __tablename__ = "edgar_fundamentals"
+    __table_args__ = (
+        Index("ix_edgar_ticker_year", "ticker", "fiscal_year"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)          # f"{ticker}-{fy}-{fp}"
+    ticker: Mapped[str] = mapped_column(String(16), nullable=False)
+    fiscal_year: Mapped[int] = mapped_column(Integer, nullable=False)
+    fiscal_period: Mapped[str] = mapped_column(String(4), nullable=False)   # "Q1","Q2","Q3","Q4","FY"
+    period_end: Mapped[str | None] = mapped_column(String(10), nullable=True)       # YYYY-MM-DD
+    filed_date: Mapped[str] = mapped_column(String(10), nullable=False)      # YYYY-MM-DD — point-in-time key
+    revenue: Mapped[float | None] = mapped_column(Float, nullable=True)
+    net_income: Mapped[float | None] = mapped_column(Float, nullable=True)
+    gross_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    operating_income: Mapped[float | None] = mapped_column(Float, nullable=True)
+    total_assets: Mapped[float | None] = mapped_column(Float, nullable=True)
+    long_term_debt: Mapped[float | None] = mapped_column(Float, nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class Score(Base):

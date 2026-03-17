@@ -1,184 +1,222 @@
 # Prediction Engine Runbook
 
-Quick reference for running, evaluating, and iterating on the prediction engine.
-All commands run inside Docker — prefix every command with `docker compose run --rm engine`.
+Quick reference for running, evaluating, and iterating on the LightGBM stock
+outperformance prediction engine.
 
 ---
 
-## The Iteration Loop
-
-The core workflow: **run eval → read results → change one thing → repeat**.
+## Architecture in one line
 
 ```
-╔══════════════════════════════════════════════════════╗
-║  ITERATION LOOP                                      ║
-║                                                      ║
-║  1. docker compose build engine        (after edits) ║
-║  2. evaluate.py --run-eval --diagnose  (run + score) ║
-║  3. Read diagnosis, make one change                  ║
-║  4. Go to 1                                          ║
-╚══════════════════════════════════════════════════════╝
+yfinance snapshots (SQLite)  →  LightGBM + CalibratedClassifierCV  →  P(beat SPY over 12 months)
 ```
 
-**Fixed eval set** (locked — never change, ensures apples-to-apples comparison):
-- Tickers: AAPL MSFT GOOGL AMZN META NVDA JPM XOM JNJ BRK-B
-- Years: 2022 (bear), 2023 (bull), 2024 (bull)
-- ~30 predictions
-
-| Config | Model | Workers | Time | Cost |
-|--------|-------|---------|------|------|
-| `stock-v1.yaml` | Sonnet | 1 | ~10 min | ~$0.30 |
-| `stock-v1-fast.yaml` | Haiku | 5 | **~1 min** | ~$0.02 |
-
-**Always use `stock-v1-fast.yaml` for iteration.** Use `stock-v1.yaml` only for a final
-validation run once you have a config worth committing to.
+No API calls in the prediction loop. Train and backtest run in seconds from cached DB.
 
 ---
 
-## Core Commands
+## Interactive dev workflow (the fast loop)
 
-### Rebuild (required after any code/config change)
-```bash
-docker compose build engine
+```
+make iterate          # train → backtest → results  (seconds, no network)
+make results          # just re-read last results
+make forecast-stocks-ml  # live 2026 predictions (fetches fresh yfinance data)
 ```
 
-### Run + Evaluate in one command
+After any `pyproject.toml` change: `make build` first.
+
+---
+
+## Core commands
+
+### Data setup (one-time or on-demand)
+
 ```bash
-# Run fixed eval set with Haiku (fast, ~1 min), print report, ask Claude for next step
-docker compose run --rm engine python scripts/evaluate.py \
-  --run-eval --config experiments/stock-v1-fast.yaml --diagnose
+# Populate FRED macro table (2018–2025 FRED signals, ~30s, 8 network calls)
+make populate-fred
+
+# Fetch stock snapshots for all 187 tickers × 8 years (~10 min, one-time)
+make fetch-snapshots-extended
+
+# Fetch EDGAR XBRL fundamentals (one-time, ~2 min)
+make fetch-edgar
 ```
 
-### Evaluate only (no new backtest run)
+### Fast iteration loop
+
 ```bash
-# Most recent run, human-readable report
-docker compose run --rm engine python scripts/evaluate.py
-
-# Most recent run, JSON output (for Claude to parse programmatically)
-docker compose run --rm engine python scripts/evaluate.py --json
-
-# Specific run by name prefix
-docker compose run --rm engine python scripts/evaluate.py --run backtest-stock-v1-live-2026-03-16
-
-# Compare two runs side-by-side
-docker compose run --rm engine python scripts/evaluate.py \
-  --run backtest-stock-v1-live-2026-03-16-1200 \
-  --compare backtest-stock-v1-live-2026-03-16-1430
+make train-stocks          # Step 1 — train LightGBM from DB cache (seconds)
+make backtest-stocks-ml    # Step 2 — walk-forward backtest, 187 tickers × 4 years
+make results               # Step 3 — human-readable summary
+make iterate               # Steps 1-3 in one command
 ```
 
-### Run backtest manually (more control)
+### Live forecast
+
 ```bash
-# Fixed eval set (same as --run-eval above)
-docker compose run --rm engine python scripts/backtest_stocks.py \
-  --config experiments/stock-v1.yaml \
-  --tickers AAPL,MSFT,GOOGL,AMZN,META,NVDA,JPM,XOM,JNJ,BRK-B \
-  --years 2022,2023,2024
-
-# Dry run — validates pipeline without API calls (~10s, free)
-docker compose run --rm engine python scripts/backtest_stocks.py \
-  --config experiments/stock-v1.yaml \
-  --tickers AAPL,MSFT,GOOGL \
-  --years 2023 \
-  --dry-run
-
-# Broader run (all 50 tickers × 4 years ≈ 200 predictions, ~20 min, ~$2)
-docker compose run --rm engine python scripts/backtest_stocks.py \
-  --config experiments/stock-v1.yaml
+make forecast-stocks-ml    # Current Jan 2026 fundamentals → P(beat SPY)
 ```
 
-### Run live forecast (current predictions, no scoring)
+### Utilities
+
 ```bash
-docker compose run --rm engine python scripts/stock_forecast.py \
-  --config experiments/stock-v1.yaml
-
-# Specific tickers only
-docker compose run --rm engine python scripts/stock_forecast.py \
-  --config experiments/stock-v1.yaml \
-  --tickers AAPL,NVDA,MSFT
-```
-
-### Corpus ingestion
-```bash
-# Fundamentals (S&P 500 historical snapshots — required for stock predictions)
-docker compose run --rm engine python scripts/ingest.py --source fundamentals
-
-# GDELT news events (geopolitics corpus)
-docker compose run --rm engine python scripts/ingest.py --source gdelt --days 7
-
-# SEC EDGAR filings (corporate events corpus)
-docker compose run --rm engine python scripts/ingest.py --source edgar
+make shell                 # bash inside the container
+make test                  # run test suite
+make lint                  # ruff linter
+make compare RUN1=<id> RUN2=<id>   # diff two backtest runs
 ```
 
 ---
 
-## Experiment Configs (`experiments/`)
+## Key files
 
-| Config | Corpus | Domain | Notes |
-|--------|--------|--------|-------|
-| `stock-v1.yaml` | `fundamentals` | Finance | **Active** — stock outperformance |
-| `v3-gdelt.yaml` | `gdelt_events` | Geopolitics | GDELT news corpus |
-| `finance-v4-edgar.yaml` | `edgar_events` | Finance | SEC filings corpus |
-
-To create a new experiment: copy `stock-v1.yaml`, change `name` + any params, run backtest.
-
----
-
-## Success Metrics
-
-| Metric | Random baseline | Good | Great |
-|--------|----------------|------|-------|
-| Overall Brier | 0.2500 | < 0.2300 | < 0.2000 |
-| High-confidence bucket Brier | 0.2500 | < 0.2200 | < 0.1800 |
-| Mean prediction | — | 45–55% | 48–52% |
-| Regime gap (2022 vs 2023) | — | < 0.05 | < 0.02 |
-
-**North star: High-confidence bucket Brier < 0.20** — this is the only bucket that matters
-for acting on signals. Low/Med confidence predictions are noise.
+| File | Purpose |
+|------|---------|
+| `src/synthesis/stock_features.py` | Snapshot dict → 24-feature vector |
+| `src/synthesis/stock_predictor.py` | StockMLPredictor, confidence_label |
+| `scripts/train_stocks.py` | LightGBM training, saves `data/models/lgbm_stock_v1.pkl` |
+| `scripts/backtest_stocks.py` | Expanding walk-forward backtest |
+| `scripts/stock_forecast.py` | Live predictions → stored in DB |
+| `scripts/fetch_snapshots_extended.py` | yfinance → SQLite (187 tickers × N years) |
+| `scripts/populate_fred_macro.py` | FRED macro signals → `fred_macro` table |
+| `src/db/models.py` | ORM: StockSnapshot, FredMacro, EdgarFundamentals, Prediction |
+| `experiments/iteration-log.md` | Every iteration, before/after Brier, decisions |
+| `tasks/backlog.md` | Prioritized improvement ideas |
 
 ---
 
-## What Claude Can Change Autonomously
+## Success metrics
 
-When running the iteration loop, Claude will propose and implement changes. Here's the scope:
+| Metric | Random baseline | Current (Iter 23) | Target |
+|--------|----------------|-------------------|--------|
+| Overall Brier | 0.2500 | **0.2373** | < 0.2200 |
+| 2022 Brier | 0.2500 | 0.2501 | < 0.2400 |
+| 2023 Brier | 0.2500 | 0.2129 | — |
+| 2024 Brier | 0.2500 | 0.2157 | — |
+| Mean prediction | — | 48.6% | 45–55% |
+
+Brier score: `(probability − actual)²`. Lower is better. Random guesser = 0.2500.
+
+---
+
+## What Claude can change autonomously
 
 | Change | Auto | Ask first |
 |--------|------|-----------|
-| Edit prompt (`src/synthesis/prompts/stock-v1.txt`) | ✓ | |
-| New prompt version (copy + edit) | ✓ | |
-| Experiment YAML (top_k, similarity_type, weights) | ✓ | |
-| Add/remove signals in `fundamentals.py` | | ✓ |
-| Change analyst bias correction constant | ✓ | |
-| New corpus source (new ingestion script) | | ✓ |
-| DB schema changes | | ✓ always |
+| Edit `stock_features.py` (add/remove features) | ✓ | |
+| Edit `train_stocks.py` (hyperparams, calibration) | ✓ | |
+| Run `make iterate` / `make agent-iterate` | ✓ | |
+| Log results in `iteration-log.md` | ✓ | |
+| Create branches, commit, push | ✓ | |
+| Run `make fetch-snapshots-year YEAR=YYYY` | ✓ | |
+| DB schema changes (new Alembic migration) | | ✓ always |
+| Add new data sources | | ✓ |
+| Run `make fetch-snapshots-extended` (full re-fetch) | | ✓ |
+| Change `stock_forecast.py` (affects live predictions) | | ✓ |
 
 ---
 
-## Interpreting Results
+## Autonomous agent
 
-**Brier score**: `(probability - actual_outcome)²`. Lower = better. A model that always
-predicts 50% scores 0.25. A model predicting 80% on a 50-50 question scores 0.09 if
-correct, 0.64 if wrong — high confidence is punished hard for errors.
+Run the agent once to iterate hands-free through the backlog. It notifies you via
+push notification before each iteration and when it stops.
 
-**Confidence calibration**: If the model says 70%, the actual outcome rate should be ~70%.
-If it says 70% but stocks only outperform 45% of the time, the model is overconfident.
+### One-time setup
 
-**Regime sensitivity**: If 2022 (bear market) Brier >> 2023 (bull market) Brier, the
-model learned bull-market patterns and fails in downturns. Fix: add macro regime context
-to the corpus or prompt.
+**1. WhatsApp bridge (Baileys)**
 
-**Analogue quality gap**: If correct predictions have higher mean similarity than wrong
-predictions, the corpus is working. If no gap, the corpus is not driving accuracy.
+The bridge runs as a sidecar container and maintains a persistent WebSocket connection
+to WhatsApp's servers using your personal account — no third-party service, no Twilio.
+
+```bash
+# Build the bridge image
+make agent-build
+
+# Add your number to .env
+echo "WHATSAPP_TO=+12125551234" >> .env
+
+# Start the bridge and scan the QR code (same as linking WhatsApp Web)
+make whatsapp-setup
+```
+
+Scan the QR with WhatsApp → Linked Devices → Link a Device. The session is saved to
+the `whatsapp_auth` Docker volume — you only scan once. After that:
+
+```bash
+make whatsapp-start   # keeps the bridge running in the background
+make whatsapp-logs    # confirm "[wa] Connected ✓"
+```
+
+To re-link (e.g. after a logout): `docker volume rm 05-engineering_whatsapp_auth` then
+`make whatsapp-setup` again.
+
+**ntfy.sh fallback (optional)**
+If the WhatsApp bridge is unreachable, `notify.py` automatically falls back to ntfy.sh.
+To enable: pick a secret slug, install the [ntfy app](https://ntfy.sh), subscribe to
+the topic, and add `NTFY_TOPIC=your-slug` to `.env`.
+
+**2. GitHub PAT**
+- Go to GitHub → Settings → Developer Settings → Personal Access Tokens → Fine-grained
+- Permissions needed: `Contents: Read & Write` (to push branches)
+- Add to `.env`:
+  ```
+  GITHUB_TOKEN=ghp_xxxxxxxxxxxx
+  GITHUB_REPO=markstoughton/agent-preneur
+  ```
+
+**3. Build the agent image (once)**
+```bash
+make agent-build
+```
+
+### Running the agent
+
+```bash
+make agent
+```
+
+The agent will:
+1. Read `experiments/iteration-log.md` and `tasks/backlog.md`
+2. Send a notification before each iteration: what it's trying, current Brier, backlog count
+3. Create branch `iter-N-<slug>`, make one change, run `make agent-iterate`
+4. Push branch on improvement; delete branch and stay on main on regression
+5. After 5 iterations (or on 3 consecutive regressions): send notification and exit
+
+Run `make agent` again to continue after the 5-iteration checkpoint.
+
+### Stop conditions
+
+| Condition | Notification |
+|-----------|-------------|
+| 3 consecutive regressions | Urgent — review `iteration-log.md` |
+| 5 iterations complete | High — run `make agent` to continue |
+| Backlog exhausted | High — time to add new ideas |
+| Brier < 0.220 | Urgent — target reached |
+
+### Important: don't run agent and interactive dev simultaneously
+
+Both use `./data/engine.db`. Running `make agent` and `make iterate` at the same
+time will corrupt the DB. The agent uses `docker-compose.agent.yml`; interactive
+dev uses `docker-compose.yml` — they are otherwise independent.
 
 ---
 
 ## Troubleshooting
 
-**"ChromaDB collection does not exist"** → run `ingest.py --source fundamentals` first
+**`make iterate` shows no improvement after feature change**
+→ Verify the feature is in both `STOCK_FEATURE_NAMES` and the return dict in `extract_stock_features()`. Length mismatch will silently use wrong feature ordering.
 
-**"No completed backtest runs found"** → run `backtest_stocks.py` first
+**"no such table: fred_macro"**
+→ Run `make populate-fred` and `alembic upgrade head`.
 
-**All predictions are bearish** → mean output well below 50%; check `evaluate.py` bias
-warning. May need to adjust `_ANALYST_BIAS` in `stock_forecast.py` or rewrite prompt.
+**All predictions near 50% / high Brier**
+→ Check calibration: mean prediction should be 45–55%. If training data has no bear-market examples, the model will predict 50% for everything in downturns.
 
-**Retrieval errors in backtest** → collection may have been created with wrong distance
-metric. Delete chroma volume and re-ingest: `docker compose down -v && ingest.py --source fundamentals`
+**Agent exits immediately**
+→ Check that `ANTHROPIC_API_KEY` is set in `.env` and `AGENT_TASK.md` exists.
+
+**Agent can't push to GitHub**
+→ Verify `GITHUB_TOKEN` has `Contents: Write` on the correct repo. Check `GITHUB_REPO` matches `owner/repo` exactly.
+
+**`make fetch-snapshots-extended` fails partway through**
+→ It's idempotent — re-run and it skips already-cached rows. Use `--years YYYY` to retry a specific year.

@@ -1,5 +1,9 @@
-.PHONY: build run ingest ingest-corpus shell jupyter lint test clean \
-        train-stocks backtest-stocks backtest-stocks-ml forecast-stocks forecast-stocks-ml
+.PHONY: build shell jupyter lint test \
+        train-stocks backtest-stocks-ml forecast-stocks-ml \
+        fetch-snapshots fetch-snapshots-extended fetch-edgar populate-fred \
+        results results-json iterate compare \
+        agent-build agent agent-iterate agent-results fetch-snapshots-year \
+        whatsapp-setup
 
 ## Build the Docker image (run this after any pyproject.toml change)
 build:
@@ -14,6 +18,16 @@ build:
 ## Rapid iteration loop (seconds each after fetch-snapshots):
 ##   make train-stocks  →  make backtest-stocks-ml  →  tweak  →  repeat
 ## -----------------------------------------------------------------------
+
+## Fetch SEC EDGAR XBRL fundamentals for all tickers (one-time, ~2 min)
+## Idempotent — skips tickers already cached; use ARGS="--refresh" to re-fetch all
+fetch-edgar:
+	docker compose run --rm engine python scripts/fetch_edgar_fundamentals.py $(ARGS)
+
+## Step 0a (ONE-TIME) — Populate fred_macro table with FRED indicators for 2018–2025
+## Safe to re-run: skips years already cached. (~8 network calls, ~30s)
+populate-fred:
+	docker compose run --rm engine python scripts/populate_fred_macro.py
 
 ## Step 0 (ONE-TIME) — Fetch historical snapshots from yfinance, cache in SQLite
 ## Re-run with: make fetch-snapshots ARGS="--refresh" to update
@@ -45,29 +59,11 @@ forecast-stocks-ml:
 ## Back-test dry-run — validates pipeline end-to-end, all predictions = 0.5
 backtest-stocks-dry:
 	docker compose run --rm engine python scripts/backtest_stocks.py \
-		--config experiments/stock-v1.yaml --dry-run
-
-## -----------------------------------------------------------------------
-## Claude-based stock workflow (original, kept for comparison)
-## -----------------------------------------------------------------------
-
-## Back-test using Claude + analogue retrieval
-backtest-stocks:
-	docker compose run --rm engine python scripts/backtest_stocks.py \
-		--config experiments/stock-v1.yaml
-
-## Forward-looking forecast using Claude
-forecast-stocks:
-	docker compose run --rm engine python scripts/stock_forecast.py \
-		--config experiments/stock-v1.yaml
+		--config experiments/stock-ml.yaml --dry-run
 
 ## -----------------------------------------------------------------------
 ## Infrastructure / utilities
 ## -----------------------------------------------------------------------
-
-## Ingest fundamentals corpus into ChromaDB
-ingest-corpus:
-	docker compose run --rm engine python scripts/ingest.py --source corpus
 
 ## Open a shell inside the container
 shell:
@@ -100,19 +96,48 @@ iterate:
 	docker compose run --rm engine python scripts/backtest_stocks.py --config experiments/stock-ml.yaml
 	docker compose run --rm engine python scripts/results_summary.py --n 1
 
+## -----------------------------------------------------------------------
+## Autonomous agent (runs Claude Code CLI inside Docker)
+## -----------------------------------------------------------------------
+
+## Build the agent Docker image (run once after Dockerfile.agent changes)
+agent-build:
+	docker compose -f docker-compose.agent.yml build
+
+## Run the autonomous agent (WhatsApp bridge starts automatically inside the container)
+agent:
+	docker compose -f docker-compose.agent.yml run --rm agent
+
+## -----------------------------------------------------------------------
+## WhatsApp bridge (Baileys — runs inside the agent container)
+## -----------------------------------------------------------------------
+
+## First-time setup: scan QR code to link your WhatsApp account.
+## Run once — session is saved to the whatsapp_auth Docker volume.
+## Ctrl+C when you see "[wa] Connected ✓"
+whatsapp-setup:
+	docker compose -f docker-compose.agent.yml run --rm -it -e WHATSAPP_SETUP=1 agent
+
+## -----------------------------------------------------------------------
+## Direct Python targets — used INSIDE the agent container (no docker nesting)
+## -----------------------------------------------------------------------
+
+## Full iteration cycle: train → backtest → results (direct Python, no Docker)
+agent-iterate:
+	python scripts/train_stocks.py --output data/models/lgbm_stock_v1.pkl
+	python scripts/backtest_stocks.py --config experiments/stock-ml.yaml
+	python scripts/results_summary.py --n 1
+
+## Results summary (direct Python)
+agent-results:
+	python scripts/results_summary.py --n 5
+
+## Fetch snapshots for a single year: make fetch-snapshots-year YEAR=2024
+## Use inside the agent container to avoid rate-limiting (one year at a time)
+fetch-snapshots-year:
+	python scripts/fetch_snapshots_extended.py --years $(YEAR)
+
 ## Run tests
 test:
 	docker compose run --rm engine pytest tests/ -v
 
-## Remove the ChromaDB volume (WARNING: destroys all embeddings — requires re-ingestion)
-clean-chroma:
-	docker compose down -v
-	@echo "ChromaDB volume removed. Run 'make ingest-corpus' to rebuild."
-
-# Legacy targets kept for backward compatibility
-run:
-	docker compose run --rm engine python scripts/run.py --config experiments/v1.yaml
-dry-run:
-	docker compose run --rm engine python scripts/run.py --config experiments/v1.yaml --dry-run --max-questions 5
-ingest:
-	docker compose run --rm engine python scripts/ingest.py --source metaculus

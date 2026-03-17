@@ -9,6 +9,7 @@ services:
       - ./notebooks:/app/notebooks       # Jupyter output synced back to host
       - ./src:/app/src                   # Source code — bind-mounted for instant iteration (no rebuild needed)
       - ./scripts:/app/scripts           # Scripts — bind-mounted for instant iteration
+      - ./alembic:/app/alembic           # Migrations — bind-mounted so new revisions apply without rebuild
 
 volumes:
   chroma_data:

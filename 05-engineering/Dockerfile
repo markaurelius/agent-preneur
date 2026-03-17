@@ -23,4 +23,4 @@ RUN mkdir -p /app/data /app/chroma
 
 ENV PATH="/app/.venv/bin:$PATH"
 
-CMD ["python", "scripts/run.py", "--config", "experiments/v1.yaml"]
+CMD ["bash"]

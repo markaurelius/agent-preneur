@@ -272,116 +272,6 @@ def _retrieve_hybrid(
 
 
 # ---------------------------------------------------------------------------
-# Claude-generated retrieval
-# ---------------------------------------------------------------------------
-
-
-def _retrieve_claude(
-    question: Question,
-    config: RunConfig,
-    anthropic_client,
-) -> list[Analogue]:
-    """Ask Claude to identify the most relevant historical analogues directly.
-
-    Returns Analogue objects backed by transient (non-DB) HistoricalEvent instances.
-    """
-    tool = {
-        "name": "submit_analogues",
-        "description": "Submit the historical analogues most relevant to the forecasting question",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "analogues": {
-                    "type": "array",
-                    "maxItems": config.top_k,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "title": {
-                                "type": "string",
-                                "description": "Short name for the event (e.g. '2008 Financial Crisis')",
-                            },
-                            "description": {
-                                "type": "string",
-                                "description": "2-3 sentence description of what happened and the conditions",
-                            },
-                            "outcome": {
-                                "type": "string",
-                                "description": "How it resolved — be specific about the result",
-                            },
-                            "relevance_score": {
-                                "type": "number",
-                                "description": "Structural similarity to the question, 0.0–1.0",
-                            },
-                            "relevance_reason": {
-                                "type": "string",
-                                "description": "One sentence on why this analogue applies",
-                            },
-                        },
-                        "required": ["title", "description", "outcome", "relevance_score"],
-                    },
-                }
-            },
-            "required": ["analogues"],
-        },
-    }
-
-    resolution_date_str = (
-        question.resolution_date.strftime("%Y-%m-%d")
-        if question.resolution_date
-        else "unknown"
-    )
-
-    prompt = (
-        f"A forecaster needs historical precedents to inform a probability estimate.\n\n"
-        f"Question: {question.text}\n"
-        f"Resolution date: {resolution_date_str}\n\n"
-        f"Identify the {config.top_k} most structurally similar historical events or episodes.\n"
-        f"Focus on structural similarity: same type of decision, similar conditions, similar actors.\n"
-        f"Be specific — name real events with dates and concrete outcomes.\n"
-        f"Do NOT speculate about how the question itself will resolve."
-    )
-
-    response = anthropic_client.messages.create(
-        model=config.model,
-        max_tokens=2048,
-        tools=[tool],
-        tool_choice={"type": "tool", "name": "submit_analogues"},
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    tool_block = next(b for b in response.content if b.type == "tool_use")
-    raw_analogues = tool_block.input.get("analogues", [])
-
-    result: list[Analogue] = []
-    for i, a in enumerate(raw_analogues[: config.top_k]):
-        # Build a transient HistoricalEvent — not persisted to DB
-        event = HistoricalEvent(
-            id=f"claude-generated-{i}",
-            description=f"{a.get('title', '')}: {a.get('description', '')}",
-            outcome=a.get("outcome", ""),
-            event_type="other",
-            region="",
-            actors=[],
-            date=None,
-            chroma_id=f"claude-generated-{i}",
-        )
-        result.append(
-            Analogue(
-                event=event,
-                similarity_score=float(a.get("relevance_score", 0.5)),
-                features_used={
-                    "source": "claude",
-                    "relevance_reason": a.get("relevance_reason", ""),
-                },
-            )
-        )
-
-    logger.debug("Claude retrieval returned %d analogues for question id=%s", len(result), question.id)
-    return result
-
-
-# ---------------------------------------------------------------------------
 # Post-retrieval filtering
 # ---------------------------------------------------------------------------
 
@@ -417,7 +307,6 @@ def retrieve_analogues(
     config: RunConfig,
     chroma_client,
     session: Session,
-    anthropic_client=None,
 ) -> list[Analogue]:
     """Retrieve the top-K most structurally similar historical events for *question*.
 
@@ -440,11 +329,6 @@ def retrieve_analogues(
     """
     mode = config.similarity_type
 
-    if mode == "claude":
-        # Return empty list — retrieval + synthesis are combined into a single
-        # Claude call in synthesize_prediction() for this mode.
-        return []
-
     if mode == "embedding":
         candidates = _retrieve_embedding(
             question, config, chroma_client, session, n_results=config.top_k * 4
@@ -458,4 +342,4 @@ def retrieve_analogues(
     if mode == "hybrid":
         return _filter_meaningful(_retrieve_hybrid(question, config, chroma_client, session), config.top_k)
 
-    raise ValueError(f"Unknown similarity_type '{mode}'. Must be embedding, hybrid, metadata, or claude.")
+    raise ValueError(f"Unknown similarity_type '{mode}'. Must be embedding, hybrid, or metadata.")

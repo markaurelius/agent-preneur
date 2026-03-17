@@ -13,7 +13,7 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from src.synthesis.predictor import PredictionResult
+from src.synthesis.prediction_result import PredictionResult
 from src.synthesis.stock_features import (
     STOCK_FEATURE_NAMES,
     extract_stock_features,

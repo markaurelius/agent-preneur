@@ -1,0 +1,13 @@
+{
+  "name": "whatsapp-bridge",
+  "version": "1.0.0",
+  "description": "Thin HTTP bridge between the stock agent and WhatsApp via Baileys",
+  "main": "index.js",
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "latest",
+    "express": "^4.19.2",
+    "pino": "^9.0.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}

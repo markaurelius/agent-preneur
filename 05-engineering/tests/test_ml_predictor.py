@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.synthesis.ml_predictor import AnaloguAggregator, MLPredictor
-from src.synthesis.predictor import PredictionResult
+from src.synthesis.prediction_result import PredictionResult
 
 
 # ---------------------------------------------------------------------------

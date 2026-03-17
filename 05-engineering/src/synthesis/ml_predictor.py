@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from src.retrieval.retriever import Analogue
 
 from src.synthesis.feature_extractor import extract_features, features_to_vector
-from src.synthesis.predictor import PredictionResult
+from src.synthesis.prediction_result import PredictionResult
 
 
 class AnaloguAggregator:

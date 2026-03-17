@@ -82,7 +82,7 @@ def main() -> None:
 
     from src.db.models import StockSnapshot
     from src.db.session import get_session
-    from src.synthesis.stock_features import STOCK_FEATURE_NAMES, features_to_vector
+    from src.synthesis.stock_features import STOCK_FEATURE_NAMES, extract_stock_features, features_to_vector
 
     # -----------------------------------------------------------------------
     # Load from DB cache — fast, no network calls
@@ -120,7 +120,9 @@ def main() -> None:
         {
             "ticker": r.ticker,
             "year": r.year,
-            "vec": features_to_vector(r.features_json),
+            # Re-extract from snapshot_json so any new features in extract_stock_features
+            # are included without needing to re-fetch from yfinance.
+            "vec": features_to_vector(extract_stock_features(r.snapshot_json)),
             "label": float(r.label),
         }
         for r in rows

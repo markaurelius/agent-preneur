@@ -7,6 +7,8 @@ services:
       - ./data:/app/data                 # SQLite DB + raw corpus files (host-inspectable)
       - ./experiments:/app/experiments   # Run configs (edit on host, execute in container)
       - ./notebooks:/app/notebooks       # Jupyter output synced back to host
+      - ./src:/app/src                   # Source code — bind-mounted for instant iteration (no rebuild needed)
+      - ./scripts:/app/scripts           # Scripts — bind-mounted for instant iteration
 
 volumes:
   chroma_data:

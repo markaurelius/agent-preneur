@@ -9,25 +9,55 @@ from __future__ import annotations
 import math
 
 STOCK_FEATURE_NAMES: list[str] = [
-    "pe_ratio",           # trailing P/E, winsorized to [0, 100]
-    "pe_vs_sector",       # P/E / sector median P/E  (1.0 = in-line with sector)
-    "revenue_growth_ttm", # TTM revenue growth %
-    "gross_margin",       # gross margin %
-    "momentum_12_1",      # 12-1 month price momentum %
-    "macro_bull",         # 1.0 if bull market environment
-    "macro_bear",         # 1.0 if bear market environment
-    "macro_rate_rising",  # 1.0 if rising rate environment
-    "macro_rate_falling", # 1.0 if falling rate environment
-    "earnings_rev_up",    # 1.0 if analyst revision trend is up
-    "earnings_rev_down",  # 1.0 if analyst revision trend is down
-    "roe",                # return on equity %
-    "debt_to_equity",     # debt-to-equity ratio
-    "short_pct_float",    # short % of float
-    "price_vs_52w_high",  # current price / 52-week high (≤ 1.0 = below high)
-    "price_vs_52w_low",   # current price / 52-week low (≥ 1.0 = above low)
+    "pe_ratio",              # trailing P/E, winsorized to [0, 100]
+    "pe_vs_sector",          # P/E / sector median P/E  (1.0 = in-line with sector)
+    "revenue_growth_ttm",    # TTM revenue growth %
+    "gross_margin",          # gross margin %
+    "momentum_12_1",         # 12-1 month price momentum %
+    "macro_bull",            # 1.0 if bull market environment
+    "macro_bear",            # 1.0 if bear market environment
+    "macro_rate_rising",     # 1.0 if rising rate environment
+    "macro_rate_falling",    # 1.0 if falling rate environment
+    "earnings_rev_up",       # 1.0 if analyst revision trend is up
+    "earnings_rev_down",     # 1.0 if analyst revision trend is down
+    "roe",                   # return on equity %
+    "debt_to_equity",        # debt-to-equity ratio
+    "short_pct_float",       # short % of float
+    "beta",                  # 5Y monthly beta (>1 = high-vol growth, <1 = defensive)
+    "dividend_yield",        # annual dividend yield % (high = defensive/value)
+    # NOTE: price_vs_52w_high and price_vs_52w_low removed in Iteration 3.
+    # They dominated feature importance (85%+ gain) but caused regime-change
+    # mispredictions (T 2022: prob=0.01, actual BEAT+23.8%). The model was
+    # overfitting to momentum which doesn't transfer across bear/bull transitions.
+    # Sector one-hot flags (enables sector-rotation learning)
+    "sector_technology",
+    "sector_healthcare",
+    "sector_financials",
+    "sector_consumer_disc",
+    "sector_consumer_staples",
+    "sector_industrials",
+    "sector_energy",
+    "sector_communication",
 ]
 
 _WINSOR_PE_MAX = 100.0
+_PRICE_VS_LOW_MAX = 3.0  # cap to reduce outlier dominance
+
+# yfinance sector string → feature flag name
+_SECTOR_FLAG_MAP: dict[str, str] = {
+    "Technology": "sector_technology",
+    "Healthcare": "sector_healthcare",
+    "Health Care": "sector_healthcare",
+    "Financial Services": "sector_financials",
+    "Financials": "sector_financials",
+    "Consumer Cyclical": "sector_consumer_disc",
+    "Consumer Discretionary": "sector_consumer_disc",
+    "Consumer Defensive": "sector_consumer_staples",
+    "Consumer Staples": "sector_consumer_staples",
+    "Industrials": "sector_industrials",
+    "Energy": "sector_energy",
+    "Communication Services": "sector_communication",
+}
 
 
 def _safe(val: object, default: float = 0.0) -> float:
@@ -79,13 +109,24 @@ def extract_stock_features(snapshot: dict) -> dict[str, float]:
     roe = _safe(snapshot.get("roe"), default=0.0)
     debt_to_equity = _safe(snapshot.get("debt_to_equity"), default=0.0)
     short_pct = _safe(snapshot.get("short_percent_float"), default=0.0)
+    beta = _safe(snapshot.get("beta"), default=1.0)  # 1.0 = market beta as neutral default
+    div_yield = _safe(snapshot.get("dividend_yield"), default=0.0)
 
-    # Price vs 52-week range
-    current_price = _safe(snapshot.get("current_price"), default=0.0)
-    high_52w = _safe(snapshot.get("price_52w_high"), default=0.0)
-    low_52w = _safe(snapshot.get("price_52w_low"), default=0.0)
-    price_vs_52w_high = (current_price / high_52w) if high_52w > 0 else 1.0
-    price_vs_52w_low = (current_price / low_52w) if low_52w > 0 else 1.0
+    # Sector one-hot flags
+    sector = snapshot.get("sector") or "Unknown"
+    sector_flag = _SECTOR_FLAG_MAP.get(sector, None)
+    sector_features = {
+        "sector_technology": 0.0,
+        "sector_healthcare": 0.0,
+        "sector_financials": 0.0,
+        "sector_consumer_disc": 0.0,
+        "sector_consumer_staples": 0.0,
+        "sector_industrials": 0.0,
+        "sector_energy": 0.0,
+        "sector_communication": 0.0,
+    }
+    if sector_flag and sector_flag in sector_features:
+        sector_features[sector_flag] = 1.0
 
     return {
         "pe_ratio": pe_ratio,
@@ -102,8 +143,9 @@ def extract_stock_features(snapshot: dict) -> dict[str, float]:
         "roe": roe,
         "debt_to_equity": debt_to_equity,
         "short_pct_float": short_pct,
-        "price_vs_52w_high": price_vs_52w_high,
-        "price_vs_52w_low": price_vs_52w_low,
+        "beta": beta,
+        "dividend_yield": div_yield,
+        **sector_features,
     }
 
 

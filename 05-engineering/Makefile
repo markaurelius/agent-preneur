@@ -17,8 +17,15 @@ build:
 
 ## Step 0 (ONE-TIME) — Fetch historical snapshots from yfinance, cache in SQLite
 ## Re-run with: make fetch-snapshots ARGS="--refresh" to update
+## Fetch only TOP-50:   make fetch-snapshots
+## Fetch full extended: make fetch-snapshots-extended  (~2-3 hours, run once)
 fetch-snapshots:
 	docker compose run --rm engine python scripts/fetch_snapshots.py $(ARGS)
+
+## Fetch full ~250-ticker S&P 500 extended universe (run once, ~2-3 hours)
+## Idempotent — skips tickers already cached; use ARGS="--refresh" to re-fetch all
+fetch-snapshots-extended:
+	docker compose run --rm engine python scripts/fetch_snapshots_extended.py $(ARGS)
 
 ## Step 1 — Train LightGBM from cached snapshots (seconds, no network calls)
 train-stocks:

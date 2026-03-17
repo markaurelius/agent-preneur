@@ -45,6 +45,9 @@ When routing a specific task from `/build [task]`:
 | Docker, CI/CD, deployment, environment config, monitoring | `devops` |
 | Event tracking, analytics pipelines, schema design | `data` |
 | Auth flows, input validation, secrets, dependency review | `security` (as reviewer after implementation) |
+| **ML model changes, feature engineering, hyperparameters, Brier analysis** | **`ml-specialist`** |
+| **Finance/market interpretation, sector rotation, macro analysis, feature proposals** | **`finance-specialist`** |
+| **Corpus expansion, new data sources (FRED, EDGAR, SimFin), ticker universe** | **`data-corpus`** |
 
 Tasks that span disciplines: implement backend first, then frontend, then security review.
 

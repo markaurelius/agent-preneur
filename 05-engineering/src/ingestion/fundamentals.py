@@ -20,9 +20,10 @@ from datetime import datetime, timezone
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Top-50 S&P 500 tickers (hardcoded per spec)
+# S&P 500 ticker universe (tiered by market cap)
 # ---------------------------------------------------------------------------
 
+# Tier 1: Top-50 by market cap — original training set
 TOP_50_SP500: list[str] = [
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "BRK-B", "LLY", "AVGO",
     "JPM", "V", "UNH", "XOM", "MA", "HD", "PG", "COST", "JNJ", "NFLX",
@@ -30,6 +31,43 @@ TOP_50_SP500: list[str] = [
     "MCD", "GE", "NOW", "ISRG", "TXN", "QCOM", "IBM", "CAT", "AMGN", "INTU",
     "SPGI", "BKNG", "GS", "AXP", "BLK", "RTX", "T", "DHR", "NEE", "LOW",
 ]
+
+# Tier 2: Tickers 51-250 by approximate market cap (large-cap S&P 500 members)
+# Expanding corpus from 250 → 1,250 training samples (5 years × 250 tickers).
+# Run `make fetch-snapshots ARGS="--tickers SP500_EXTENDED"` — or pass the
+# expanded list directly: `make fetch-snapshots` after setting DEFAULT_TICKERS.
+SP500_NEXT_200: list[str] = [
+    # Large-cap tech / communication
+    "PLTR", "CSCO", "TMUS", "VZ", "ANET", "MU", "PANW", "ADI", "AMAT", "KLAC",
+    "LRCX", "SNPS", "CDNS", "ADSK", "MSI", "HPQ", "HPE", "NTAP",
+    # Financials / insurance
+    "MS", "WFC", "USB", "COF", "SCHW", "ICE", "CME", "MCO", "FISV", "AON",
+    "MMC", "HIG", "CB", "AFL", "ALL", "TROW", "WTW", "PGR",
+    # Healthcare / pharma / biotech
+    "ABT", "GILD", "REGN", "VRTX", "MRNA", "BMY", "BIIB", "IDXX", "DXCM",
+    "IQV", "EW", "SYK", "ZTS", "BDX", "GEHC", "HCA", "CI", "CVS", "ELV", "MCK",
+    # Consumer / retail / food & bev
+    "KO", "PEP", "PM", "MO", "MDLZ", "CL", "KMB", "SBUX", "NKE", "TJX",
+    "COST",  # already in TOP_50, dedup handled by set logic
+    "DHI", "LEN",
+    # Industrials / defense / aero
+    "HON", "ETN", "DE", "PH", "EMR", "ITW", "ROK", "MMM", "PCAR", "CTAS",
+    "GWW", "FAST", "FTV", "ROP", "TT", "NSC", "UNP", "CSX", "ODFL", "FDX",
+    "UPS", "JBHT", "XPO", "PWR", "LMT", "GD", "NOC", "TDG", "RTX",  # RTX already in TOP_50
+    # Energy
+    "COP", "SLB", "EOG", "OXY", "PSX", "MPC", "HAL", "EQT", "DVN",
+    # Real estate / REITs
+    "PLD", "SPG", "AMT", "CCI", "DLR", "IRM", "AVB", "O", "WELL",
+    # Utilities
+    "SO", "DUK", "SRE", "D", "EXC", "AEP", "XEL", "WEC", "CEG", "PCG", "VST",
+    # Materials
+    "SHW", "ECL", "NUE", "STLD", "FCX",
+    # Miscellaneous large-cap
+    "ADP", "VRSK", "FICO", "WM", "MCK", "OKE", "PYPL", "UBER",
+]
+
+# Full expanded universe: TOP_50 + NEXT_200, deduplicated
+SP500_EXTENDED: list[str] = list(dict.fromkeys(TOP_50_SP500 + SP500_NEXT_200))
 
 # S&P 500 benchmark ticker (yfinance)
 _SP500_TICKER = "^GSPC"
@@ -547,6 +585,9 @@ def get_current_snapshots(tickers: list[str]) -> list[dict]:
 
     snapshots: list[dict] = []
 
+    # Fetch macro regime once — same for all tickers (current market conditions)
+    current_macro_regime = fetch_macro_regime(year=None)
+
     for i, ticker in enumerate(tickers):
         logger.info("[%d/%d] Fetching current snapshot for %s", i + 1, len(tickers), ticker)
         try:
@@ -628,6 +669,13 @@ def get_current_snapshots(tickers: list[str]) -> list[dict]:
             # Short interest
             short_percent_float = _safe(info.get("shortPercentOfFloat"))
 
+            # Beta and dividend yield (added in Iteration 7)
+            beta = _safe(info.get("beta"))
+            div_yield_raw = info.get("dividendYield")
+            dividend_yield = round(float(div_yield_raw) * 100, 3) if div_yield_raw else None
+
+            macro_regime = current_macro_regime
+
             snapshots.append(
                 {
                     "ticker": ticker,
@@ -652,6 +700,9 @@ def get_current_snapshots(tickers: list[str]) -> list[dict]:
                     "roe": roe,
                     "debt_to_equity": debt_to_equity,
                     "short_percent_float": short_percent_float,
+                    "beta": beta,
+                    "dividend_yield": dividend_yield,
+                    "macro_regime": macro_regime,
                 }
             )
 
@@ -677,6 +728,8 @@ def get_current_snapshots(tickers: list[str]) -> list[dict]:
                     # New signals — all None on error
                     "momentum_12_1": None,
                     "earnings_revision": "neutral",
+                    "beta": None,
+                    "dividend_yield": None,
                     "pe_vs_sector": None,
                     "roe": None,
                     "debt_to_equity": None,

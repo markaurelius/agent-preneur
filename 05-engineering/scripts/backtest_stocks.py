@@ -728,7 +728,7 @@ def main() -> None:
             # trained on ALL years). For each test year Y we train a fresh
             # LightGBM+calibration pipeline on years < Y only.
             from src.db.models import StockSnapshot
-            from src.synthesis.stock_features import STOCK_FEATURE_NAMES, features_to_vector
+            from src.synthesis.stock_features import STOCK_FEATURE_NAMES, extract_stock_features, features_to_vector
 
             import numpy as np
             try:
@@ -801,8 +801,9 @@ def main() -> None:
                     logger.warning("Skipping test_year=%d: no test rows in DB", test_year)
                     continue
 
-                # Build train arrays
-                X_tr = np.array([features_to_vector(r.features_json) for r in train_rows])
+                # Build train arrays — re-extract features from snapshot_json so any
+                # new features in extract_stock_features are included without re-fetching.
+                X_tr = np.array([features_to_vector(extract_stock_features(r.snapshot_json)) for r in train_rows])
                 y_tr = np.array([float(r.label) for r in train_rows])
 
                 n_pos_f = float(y_tr.sum())
@@ -835,7 +836,7 @@ def main() -> None:
                 )
 
                 # Predict for all test rows
-                X_te = np.array([features_to_vector(r.features_json) for r in test_rows])
+                X_te = np.array([features_to_vector(extract_stock_features(r.snapshot_json)) for r in test_rows])
                 probs = fold_model.predict_proba(
                     pd.DataFrame(X_te, columns=STOCK_FEATURE_NAMES)
                 )[:, 1].tolist()

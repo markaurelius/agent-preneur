@@ -19,6 +19,55 @@
 
 ---
 
+### Iteration 27 — min_child_samples 5→20 in fold training — 2026-03-17
+
+**Change:** Increased `min_child_samples` from 5 to 20 in `backtest_stocks.py`'s per-fold LightGBM training.
+
+**Hypothesis:** With `min_child_samples=5`, the model allows leaf groups of 5 stocks (0.9% of 561-row training set). These micro-splits are likely memorizing noise. Increasing to 20 (3.6% minimum) forces the model to learn more generalizable patterns across market regimes.
+
+**Before:** 0.2373 (iter 23 best)
+**After:** 0.2354
+**Delta:** −0.0019 (improvement!)
+**Result:** KEPT
+
+**Per-year breakdown:** 2021=0.2573, 2022=0.2577, 2023=0.2096, 2024=0.2168
+
+**Analysis:** Significant improvement in 2021 fold (0.2709→0.2573, −0.0136) and 2023 fold (0.2262→0.2096, −0.0166). The 2021 fold was the hardest because it only had 3 years of training data (2018-2020) — smaller min_child_samples allowed overfitting to COVID-era patterns. The 2022 fold regressed (0.2466→0.2577, +0.0111) because the regularization reduced the model's ability to handle the unusual 2022 rate-hiking regime. Net improvement dominated by 2021 and 2023 gains.
+
+---
+
+### Iteration 26 — Yield curve × financials interaction (financials_x_slope) — 2026-03-17
+
+**Change:** Added `financials_x_slope` = sector_financials × yield_curve_slope to `stock_features.py`.
+
+**Hypothesis:** Banks' net interest margin (NIM) scales with yield curve steepness. Positive slope → wider spread → financials outperform. Inverted slope → squeezed NIM → financials underperform. Empirical support: 2022 (slope=+0.79) → financials +9.2% avg excess; 2023 (slope=−0.53) → financials −10.3% avg excess.
+
+**Before:** 0.2373 (baseline — iter 23)
+**After:** 0.2392
+**Delta:** +0.0019 (regression)
+**Result:** REVERTED
+
+**Per-year breakdown (after):** 2021=0.2708, 2022=0.2482, 2023=0.2156, 2024=0.2223
+
+**Post-mortem:** Feature improved 2023 fold significantly (0.2262→0.2156, −0.0106) but hurt 2024 fold (0.2144→0.2223, +0.0079). The 2024 failure: slope=−0.35 predicted financials underperform, but they outperformed +4.2%. The signal works for strongly inverted curve (2023: −0.53) but fails for mildly inverted (2024: −0.35). The 2024 Fed rate-cut cycle started mid-year, which made financials resilient despite initial inversion. Net regression overall.
+
+---
+
+### Iteration 25 — Defense sector sub-flag (sector_defense for RTX/LMT/NOC/GD) — 2026-03-17
+
+**Change:** Added `sector_defense` flag to `stock_features.py`. Defense contractors (RTX, LMT, NOC, GD, HII) are yfinance-classified as "Industrials" but behave like defense (government contracts, countercyclical). The flag overrides `sector_industrials=0` for these tickers.
+
+**Hypothesis:** RTX 2022 beat SPY by +37.6pp (labeled 1) but was classified as Industrials. A dedicated flag would separate defense from cyclical industrials.
+
+**Before:** 0.2373
+**After:** 0.2395
+**Delta:** +0.0022 (regression)
+**Result:** REVERTED
+
+**Post-mortem:** `sector_defense` had 0 feature importance (only 4 tickers × 8 years = 32 rows). Feature was too sparse for LightGBM to learn any signal. Additionally, removing these 4 tickers from `sector_industrials` slightly hurt the industrial sector's feature signal. The small-n problem: with only 4 defense tickers in each fold, no reliable split surface exists.
+
+---
+
 ### Iteration 24 — Sector × macro interactions (tech_x_rate, financial_x_rate, growth_x_spread) — 2026-03-17
 
 **Change:** Added 3 sector-specific macro interaction features to `stock_features.py`:

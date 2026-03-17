@@ -17,10 +17,8 @@ import argparse
 import logging
 import os
 import sys
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -35,32 +33,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-PROMPTS_DIR = Path(__file__).parent.parent / "src" / "synthesis" / "prompts"
-
-# S&P 500 proxy
-_SPY_TICKER = "SPY"
-
 # Default years to back-test
 _DEFAULT_YEARS = [2021, 2022, 2023, 2024]
 
-# Sector median P/E map — must match fundamentals.py
-_SECTOR_MEDIAN_PE = {
-    "Technology": 28.0,
-    "Healthcare": 22.0,
-    "Financials": 13.0,
-    "Consumer Discretionary": 25.0,
-    "Consumer Staples": 22.0,
-    "Industrials": 20.0,
-    "Energy": 12.0,
-    "Materials": 16.0,
-    "Real Estate": 35.0,
-    "Utilities": 18.0,
-    "Communication Services": 20.0,
-}
-
-
 # ---------------------------------------------------------------------------
-# Data helpers
+# Profile formatter helpers
 # ---------------------------------------------------------------------------
 
 
@@ -75,233 +52,6 @@ def _safe(val, default=None):
     except (TypeError, ValueError):
         pass
     return val
-
-
-def _pct(val) -> str:
-    v = _safe(val)
-    if v is None:
-        return "N/A"
-    return f"{float(v):+.1f}%"
-
-
-def _fetch_price_at_jan1(ticker_obj, year: int) -> float | None:
-    """Return the first available close price on or after Jan 1 of year."""
-    try:
-        history = ticker_obj.history(
-            start=f"{year}-01-01",
-            end=f"{year}-03-01",
-            interval="1d",
-        )
-        if history.empty:
-            return None
-        return float(history["Close"].iloc[0])
-    except Exception as exc:
-        logger.debug("Price fetch error for %d: %s", year, exc)
-        return None
-
-
-def _fetch_annual_return(ticker_obj, year: int) -> float | None:
-    """Return stock return for the calendar year: (price_jan1_year+1 / price_jan1_year) - 1."""
-    p_start = _fetch_price_at_jan1(ticker_obj, year)
-    p_end = _fetch_price_at_jan1(ticker_obj, year + 1)
-    if p_start is None or p_end is None or p_start <= 0:
-        return None
-    return (p_end / p_start) - 1
-
-
-def _fetch_spy_annual_return(spy_obj, year: int) -> float | None:
-    """Return SPY return for the calendar year."""
-    return _fetch_annual_return(spy_obj, year)
-
-
-def _build_historical_snapshot(ticker_obj, ticker: str, year: int, info: dict) -> dict:
-    """Build a 'current profile' dict using data available at Jan 1 of year.
-
-    Mirrors the structure of get_current_snapshots() but anchored to a
-    historical date so no future data leaks in.
-    """
-    import pandas as pd
-
-    company_name = info.get("longName") or info.get("shortName") or ticker
-    sector = info.get("sector", "Unknown")
-
-    # Current price at Jan 1 of year
-    current_price = _fetch_price_at_jan1(ticker_obj, year)
-
-    # 52-week range: high/low over the prior 12 months
-    price_52w_high: float | None = None
-    price_52w_low: float | None = None
-    try:
-        hist_52w = ticker_obj.history(
-            start=f"{year - 1}-01-01",
-            end=f"{year}-01-15",
-            interval="1d",
-        )
-        if not hist_52w.empty:
-            price_52w_high = float(hist_52w["High"].max())
-            price_52w_low = float(hist_52w["Low"].min())
-    except Exception:
-        pass
-
-    # Revenue growth and gross margin: use financials for (year-1) vs (year-2)
-    revenue_growth_ttm: float | None = None
-    gross_margin: float | None = None
-    try:
-        fin = ticker_obj.financials
-        if fin is not None and not fin.empty:
-            fin = fin.T
-            fin.index = fin.index.map(lambda d: d.year if hasattr(d, "year") else None)
-            fin = fin[fin.index.notnull()]
-
-            rev_key = None
-            for k in ("Total Revenue", "Revenue", "Net Revenue"):
-                if k in fin.columns:
-                    rev_key = k
-                    break
-
-            gross_key = None
-            for k in ("Gross Profit", "Gross Income"):
-                if k in fin.columns:
-                    gross_key = k
-                    break
-
-            target_year = year - 1
-            prior_year = year - 2
-            if rev_key and target_year in fin.index and prior_year in fin.index:
-                rev_curr = _safe(fin.loc[target_year, rev_key])
-                rev_prior = _safe(fin.loc[prior_year, rev_key])
-                if rev_curr and rev_prior and float(rev_prior) != 0:
-                    revenue_growth_ttm = round(
-                        (float(rev_curr) / float(rev_prior) - 1) * 100, 2
-                    )
-                if gross_key and rev_curr and target_year in fin.index:
-                    gross = _safe(fin.loc[target_year, gross_key])
-                    if gross is not None and float(rev_curr) != 0:
-                        gross_margin = round(float(gross) / float(rev_curr) * 100, 2)
-    except Exception:
-        pass
-
-    # P/E at start of year: approximate from historical price + prior-year EPS
-    pe_ratio: float | None = None
-    try:
-        fin = ticker_obj.financials
-        if fin is not None and not fin.empty:
-            fin_t = fin.T
-            fin_t.index = fin_t.index.map(lambda d: d.year if hasattr(d, "year") else None)
-            fin_t = fin_t[fin_t.index.notnull()]
-
-            eps_key = None
-            for k in ("Diluted EPS", "Basic EPS", "EPS"):
-                if k in fin_t.columns:
-                    eps_key = k
-                    break
-
-            target_eps_year = year - 1
-            if eps_key and target_eps_year in fin_t.index:
-                eps = _safe(fin_t.loc[target_eps_year, eps_key])
-                if eps and float(eps) > 0 and current_price:
-                    pe_ratio = round(float(current_price) / float(eps), 1)
-    except Exception:
-        pass
-
-    # Momentum (12-1 month) as of Jan 1 of year
-    momentum_12_1: float | None = None
-    try:
-        end_date = pd.Timestamp(f"{year}-02-01")
-        start_date = pd.Timestamp(f"{year - 2}-01-01")
-        hist_mom = ticker_obj.history(
-            start=str(start_date.date()),
-            end=str(end_date.date()),
-            interval="1mo",
-        )
-        if hist_mom is not None and not hist_mom.empty:
-            hist_mom = hist_mom[hist_mom.index < end_date]
-            if len(hist_mom) >= 13:
-                price_12m_ago = float(hist_mom["Close"].iloc[-13])
-                price_1m_ago = float(hist_mom["Close"].iloc[-2])
-                if price_1m_ago > 0:
-                    momentum_12_1 = round((price_12m_ago / price_1m_ago - 1) * 100, 2)
-    except Exception:
-        pass
-
-    # P/E vs sector
-    pe_vs_sector: float | None = None
-    if pe_ratio is not None and sector in _SECTOR_MEDIAN_PE:
-        sector_median = _SECTOR_MEDIAN_PE[sector]
-        if sector_median > 0:
-            pe_vs_sector = round(float(pe_ratio) / sector_median, 3)
-
-    # Macro regime for the prediction year
-    from src.ingestion.fundamentals import fetch_macro_regime
-    macro_regime = fetch_macro_regime(year)
-
-    return {
-        "ticker": ticker,
-        "company_name": company_name,
-        "current_price": current_price,
-        "analyst_target_mean": None,    # not available historically
-        "analyst_target_high": None,
-        "analyst_target_low": None,
-        "analyst_recommendation": "Hold",
-        "revenue_growth_ttm": revenue_growth_ttm,
-        "gross_margin": gross_margin,
-        "pe_ratio": pe_ratio,
-        "market_cap": None,
-        "sector": sector,
-        "price_52w_high": price_52w_high,
-        "price_52w_low": price_52w_low,
-        "analyst_count": 0,
-        "momentum_12_1": momentum_12_1,
-        "earnings_revision": "neutral",   # historical revisions not available
-        "pe_vs_sector": pe_vs_sector,
-        "roe": None,
-        "debt_to_equity": None,
-        "short_percent_float": None,
-        "macro_regime": macro_regime,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Time-filtered analogue retrieval
-# ---------------------------------------------------------------------------
-
-
-def _retrieve_analogues_time_filtered(
-    question,
-    config,
-    chroma_client,
-    session,
-    anthropic_client,
-    cutoff_year: int,
-    top_k_multiplier: int = 10,
-):
-    """Retrieve analogues, then discard any whose corpus date >= cutoff year.
-
-    ChromaDB does not support range filters natively, so we over-fetch by
-    top_k_multiplier and filter in Python.
-    """
-    from src.retrieval.retriever import retrieve_analogues
-
-    # Temporarily inflate top_k to get enough candidates after date filtering
-    wide_config = config.model_copy(update={"top_k": config.top_k * top_k_multiplier})
-
-    all_analogues = retrieve_analogues(
-        question, wide_config, chroma_client, session, anthropic_client
-    )
-
-    cutoff_date_str = f"{cutoff_year}-01-01"
-    filtered = [
-        a for a in all_analogues
-        if (a.event.date or "") < cutoff_date_str
-    ]
-
-    # Return only top_k after filtering
-    return filtered[:config.top_k]
-
-
-# ---------------------------------------------------------------------------
-# Profile formatter (shared with stock_forecast.py pattern)
-# ---------------------------------------------------------------------------
 
 
 def _format_current_profile(snap: dict) -> str:
@@ -336,96 +86,6 @@ def _format_current_profile(snap: dict) -> str:
         f"Earnings revision trend: {snap.get('earnings_revision', 'N/A')}",
     ]
     return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Synthesis (mirrors stock_forecast.py)
-# ---------------------------------------------------------------------------
-
-
-def _load_prompt_template(prompt_version: str) -> str:
-    path = PROMPTS_DIR / f"{prompt_version}.txt"
-    if not path.exists():
-        raise FileNotFoundError(f"Prompt template not found: {path}")
-    return path.read_text()
-
-
-def _format_analogues_block(analogues: list) -> str:
-    lines = []
-    for n, analogue in enumerate(analogues, start=1):
-        event = analogue.event
-        lines.append(
-            f"[{n}]. {event.description}\n"
-            f"Outcome: {event.outcome}\n"
-            f"Similarity: {analogue.similarity_score:.2f}"
-        )
-    return "\n\n".join(lines) if lines else "[No historical analogues found in corpus.]"
-
-
-def _synthesize_backtest_prediction(
-    question_text: str,
-    current_profile: str,
-    resolution_date_str: str,
-    analogues: list,
-    config,
-    anthropic_client,
-    dry_run: bool = False,
-) -> tuple[float, str, int, int]:
-    """Return (probability, rationale, tokens_used, latency_ms)."""
-    if dry_run:
-        return 0.5, "[dry run]", 0, 0
-
-    from src.synthesis.predictor import PredictionResult
-
-    template = _load_prompt_template(config.prompt_version)
-    analogues_block = _format_analogues_block(analogues)
-
-    prompt = template.format(
-        question_text=question_text,
-        current_profile=current_profile,
-        resolution_date=resolution_date_str,
-        analogues_block=analogues_block,
-    )
-
-    tool = {
-        "name": "submit_forecast",
-        "description": "Submit your probability forecast and reasoning",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "probability": {
-                    "type": "number",
-                    "description": (
-                        "Probability 0.0–1.0 that this stock outperforms the S&P 500 "
-                        "over the next 12 months"
-                    ),
-                },
-                "rationale": {
-                    "type": "string",
-                    "description": "Reasoning referencing comparable cases",
-                },
-            },
-            "required": ["probability", "rationale"],
-        },
-    }
-
-    start = time.monotonic()
-    response = anthropic_client.messages.create(
-        model=config.model,
-        max_tokens=1024,
-        tools=[tool],
-        tool_choice={"type": "tool", "name": "submit_forecast"},
-        messages=[{"role": "user", "content": prompt}],
-    )
-    elapsed_ms = int((time.monotonic() - start) * 1000)
-
-    tool_block = next(b for b in response.content if b.type == "tool_use")
-    raw_prob = float(tool_block.input["probability"])
-    rationale = tool_block.input.get("rationale", "")
-    probability = max(0.01, min(0.99, raw_prob))
-    tokens_used = response.usage.input_tokens + response.usage.output_tokens
-
-    return probability, rationale, tokens_used, elapsed_ms
 
 
 # ---------------------------------------------------------------------------
@@ -499,9 +159,6 @@ def _print_results(stats: dict, dry_run: bool = False) -> None:
     print("BACK-TEST RESULTS (walk-forward, time-filtered corpus)")
     if dry_run:
         print("NOTE: dry-run mode — all predictions are 0.5 (pipeline validation only)")
-    else:
-        print("NOTE: Claude's training knowledge may leak for pre-2025 data.")
-        print("Use for calibration measurement, not absolute accuracy claims.")
     print()
 
     years_str = ", ".join(str(y) for y in stats.get("years", []))
@@ -607,7 +264,7 @@ def main() -> None:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Skip Claude API calls; return 0.5 for all predictions (validates pipeline)",
+        help="Return 0.5 for all predictions (validates pipeline end-to-end)",
     )
     args = parser.parse_args()
 
@@ -615,11 +272,6 @@ def main() -> None:
     from src.config.schema import load_config
     from src.db.session import get_session
     from src.db.models import Prediction, RunConfig as RunConfigModel, RunResult, Score
-    from src.ingestion.fundamentals import TOP_50_SP500
-
-    import anthropic
-    import chromadb
-    import yfinance as yf
 
     config = load_config(args.config)
     dry_run = config.dry_run or args.dry_run
@@ -627,11 +279,12 @@ def main() -> None:
         config = config.model_copy(update={"dry_run": True})
 
     # Resolve ticker list
+    # None means "use all tickers in DB" (resolved inside the session).
     if args.tickers:
         tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
     else:
-        tickers = TOP_50_SP500
-    if config.max_questions:
+        tickers = None  # deferred: resolved from DB inside ML branch
+    if tickers is not None and config.max_questions:
         tickers = tickers[: config.max_questions]
 
     # Resolve year list
@@ -640,40 +293,17 @@ def main() -> None:
     else:
         years = _DEFAULT_YEARS
 
-    # ML predictor bypasses Claude and ChromaDB entirely
-    ml_predictor = None
-    if config.predictor_type == "ml":
-        if not config.model_path:
-            raise ValueError("predictor_type='ml' requires model_path in the config YAML")
-        from src.synthesis.stock_predictor import StockMLPredictor
-        ml_predictor = StockMLPredictor(config.model_path)
-        logger.info("ML mode — LightGBM predictor loaded from %s", config.model_path)
+    if config.predictor_type != "ml":
+        raise ValueError("Only predictor_type='ml' is supported. Update your config YAML.")
+    if not config.model_path:
+        raise ValueError("predictor_type='ml' requires model_path in the config YAML")
 
-    chroma_path = os.environ.get("CHROMA_PATH", "/app/chroma")
-    chroma_client = chromadb.PersistentClient(path=chroma_path) if ml_predictor is None else None
-
-    if dry_run:
-        anthropic_client = None
-        logger.info("DRY RUN mode — Claude API calls skipped")
-    elif ml_predictor is not None:
-        anthropic_client = None
-        logger.info("ML mode — Claude API calls skipped")
-    else:
-        anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-
+    _ticker_count_str = str(len(tickers)) if tickers is not None else "all-DB"
     logger.info(
-        "Back-testing %d tickers x %d years = up to %d predictions",
-        len(tickers), len(years), len(tickers) * len(years),
+        "Back-testing %s tickers x %d years = up to %s predictions",
+        _ticker_count_str, len(years),
+        str(len(tickers) * len(years)) if tickers is not None else "?",
     )
-
-    # SPY benchmark returns — only needed for Claude path (ML path uses cached values)
-    spy_returns: dict[int, float | None] = {}
-    if ml_predictor is None:
-        logger.info("Fetching SPY data for benchmark returns ...")
-        spy = yf.Ticker(_SPY_TICKER)
-        for yr in years:
-            spy_returns[yr] = _fetch_spy_annual_return(spy, yr)
-            logger.debug("SPY %d: %s", yr, spy_returns[yr])
 
     with get_session() as session:
         run_name = (
@@ -689,7 +319,7 @@ def main() -> None:
             metadata_filters=config.metadata_filters,
             prompt_version=config.prompt_version,
             model=config.model,
-            max_questions=len(tickers) * len(years),
+            max_questions=(len(tickers) if tickers is not None else 0) * len(years),
             dry_run=dry_run,
         )
         session.add(run_config_row)
@@ -707,7 +337,7 @@ def main() -> None:
         print("=" * 64)
         print(f"  STOCK BACK-TEST — {run_name}")
         print(f"  run_id: {run_id[:8]}...")
-        print(f"  Tickers: {len(tickers)}  |  Years: {years}")
+        print(f"  Tickers: {len(tickers) if tickers is not None else 'all-DB'}  |  Years: {years}")
         if dry_run:
             print("  MODE: DRY RUN (all predictions = 0.5)")
         print("=" * 64)
@@ -716,13 +346,11 @@ def main() -> None:
         skipped_no_data = 0
 
         # ---------------------------------------------------------------
-        # Phase 1: Data preparation
-        # ML path: reads from DB cache (instant — no yfinance calls).
-        # Claude path: fetches from yfinance (slow, but necessary for analogues).
+        # Phase 1: Data preparation — reads from DB cache (instant, no network)
         # ---------------------------------------------------------------
         work_items: list[dict] = []
 
-        if ml_predictor is not None:
+        if True:  # ML path only
             # --- Walk-forward ML path: train per-fold models inline ---
             # This avoids data leakage from the pre-trained model (which was
             # trained on ALL years). For each test year Y we train a fresh
@@ -737,6 +365,37 @@ def main() -> None:
                 logger.error("lightgbm not installed. Rebuild Docker image: make build")
                 raise SystemExit(1)
             from sklearn.calibration import CalibratedClassifierCV
+
+            # Load FRED macro once for all years — injected into snapshot dicts
+            # before feature extraction so continuous signals override the old
+            # binary-only macro_regime JSON stored in snapshot_json.
+            from src.ingestion.fundamentals import load_fred_macro_from_db
+            fred_by_year = load_fred_macro_from_db(session)
+            if fred_by_year:
+                logger.info(
+                    "FRED macro loaded: %d years cached (%s)",
+                    len(fred_by_year), sorted(fred_by_year.keys()),
+                )
+            else:
+                logger.warning(
+                    "fred_macro table is empty — FRED signals will use defaults. "
+                    "Run 'make populate-fred' to populate."
+                )
+
+            # Resolve tickers from DB if not explicitly specified (ML path default).
+            # This uses the full universe rather than just TOP_50, giving 3-4× more
+            # evaluation rows per fold for stable Brier estimation.
+            if tickers is None:
+                tickers = sorted(set(
+                    r.ticker for r in session.query(StockSnapshot.ticker)
+                    .filter(StockSnapshot.label.isnot(None))
+                    .distinct()
+                    .all()
+                ))
+                logger.info(
+                    "ML full-universe backtest: resolved %d tickers from DB",
+                    len(tickers),
+                )
 
             # Load ALL cached snapshots (all years with labels) for walk-forward training
             all_cached = (
@@ -803,7 +462,19 @@ def main() -> None:
 
                 # Build train arrays — re-extract features from snapshot_json so any
                 # new features in extract_stock_features are included without re-fetching.
-                X_tr = np.array([features_to_vector(extract_stock_features(r.snapshot_json)) for r in train_rows])
+                # Inject FRED continuous macro signals before feature extraction so the
+                # model sees continuous values (yield_curve_slope, fed_funds_rate, etc.)
+                # rather than the old binary-only macro_regime stored in snapshot_json.
+                # NOTE: year comes from r.year (the ORM column), not from snapshot_json
+                # (which stores the profile dict and does not include a "year" key).
+                def _snap_with_fred(snap: dict, yr: int) -> dict:
+                    """Return snapshot with FRED macro injected if available for year."""
+                    if yr in fred_by_year:
+                        snap = dict(snap)  # shallow copy — never mutate the DB object
+                        snap["macro_regime"] = fred_by_year[yr]
+                    return snap
+
+                X_tr = np.array([features_to_vector(extract_stock_features(_snap_with_fred(r.snapshot_json, r.year))) for r in train_rows])
                 y_tr = np.array([float(r.label) for r in train_rows])
 
                 n_pos_f = float(y_tr.sum())
@@ -822,7 +493,7 @@ def main() -> None:
                         n_estimators=100,
                         learning_rate=0.05,
                         num_leaves=15,
-                        min_child_samples=5,
+                        min_child_samples=20,  # iter 27: 5→20 to prevent leaf-group overfitting on small folds
                         scale_pos_weight=spw_f,
                         random_state=42,
                         verbose=-1,
@@ -836,7 +507,7 @@ def main() -> None:
                 )
 
                 # Predict for all test rows
-                X_te = np.array([features_to_vector(extract_stock_features(r.snapshot_json)) for r in test_rows])
+                X_te = np.array([features_to_vector(extract_stock_features(_snap_with_fred(r.snapshot_json, r.year))) for r in test_rows])
                 probs = fold_model.predict_proba(
                     pd.DataFrame(X_te, columns=STOCK_FEATURE_NAMES)
                 )[:, 1].tolist()
@@ -930,107 +601,26 @@ def main() -> None:
                     "wf_rationale": rationale,
                 })
 
-        else:
-            # --- Claude path: fetch from yfinance ---
-            for ticker in tickers:
-                try:
-                    t = yf.Ticker(ticker)
-                    info = t.info or {}
-                except Exception as exc:
-                    logger.warning("Cannot fetch info for %s: %s — skipping", ticker, exc)
-                    continue
-
-                for year in years:
-                    label = f"{ticker} {year}"
-
-                    stock_return = _fetch_annual_return(t, year)
-                    spy_return = spy_returns.get(year)
-                    if stock_return is None or spy_return is None:
-                        skipped_no_data += 1
-                        continue
-
-                    resolution = 1.0 if stock_return > spy_return else 0.0
-                    actual_delta_pct = (stock_return - spy_return) * 100
-
-                    try:
-                        snap = _build_historical_snapshot(t, ticker, year, info)
-                    except Exception as exc:
-                        logger.warning("%s — snapshot error: %s", label, exc)
-                        skipped_no_data += 1
-                        continue
-
-                    question = _upsert_backtest_question(snap, year, session)
-                    if question.resolution_value is None:
-                        question.resolution_value = resolution
-                    session.commit()
-
-                    existing_pred = session.query(Prediction).filter_by(
-                        run_id=run_id, question_id=question.id
-                    ).first()
-                    if existing_pred:
-                        prob = existing_pred.probability_estimate or 0.5
-                        scored_records.append({
-                            "ticker": ticker, "year": year,
-                            "probability": prob, "resolution": resolution,
-                            "brier_score": (prob - resolution) ** 2,
-                            "actual_delta_pct": actual_delta_pct,
-                        })
-                        continue
-
-                    analogues = []
-                    try:
-                        analogues = _retrieve_analogues_time_filtered(
-                            question=question, config=config,
-                            chroma_client=chroma_client, session=session,
-                            anthropic_client=anthropic_client, cutoff_year=year,
-                        )
-                    except Exception as exc:
-                        logger.warning("%s — retrieval error: %s", label, exc)
-
-                    work_items.append({
-                        "ticker": ticker,
-                        "year": year,
-                        "question_id": question.id,
-                        "question_text": question.text,
-                        "current_profile": _format_current_profile(snap),
-                        "resolution_date_str": f"{year + 1}-01-01",
-                        "snap": snap,
-                        "analogues": analogues,
-                        "resolution": resolution,
-                        "actual_delta_pct": actual_delta_pct,
-                    })
-
         logger.info(
             "Data prep complete. %d predictions to synthesize, %d already done, %d skipped.",
             len(work_items), len(scored_records), skipped_no_data,
         )
 
         # ---------------------------------------------------------------
-        # Phase 2: Parallel synthesis (Claude API calls)
+        # Phase 2: Parallel synthesis (ML inference — no API calls)
         # ---------------------------------------------------------------
         n_workers = config.workers
         total_work = len(work_items)
         completed_count = 0
 
         def _synthesize_item(item: dict) -> dict:
-            if ml_predictor is not None:
-                # Use pre-computed walk-forward probability (no data leakage).
-                # wf_probability was computed by a model trained only on years
-                # strictly before item["year"].
-                probability = item["wf_probability"]
-                rationale = item["wf_rationale"]
-                tokens_used = 0
-                latency_ms = 0
-            else:
-                probability, rationale, tokens_used, latency_ms = _synthesize_backtest_prediction(
-                    question_text=item["question_text"],
-                    current_profile=item["current_profile"],
-                    resolution_date_str=item["resolution_date_str"],
-                    analogues=item["analogues"],
-                    config=config,
-                    anthropic_client=anthropic_client,
-                    dry_run=dry_run,
-                )
+            # Use pre-computed walk-forward probability (no data leakage).
+            # wf_probability was computed by a model trained only on years
+            # strictly before item["year"].
+            probability = item["wf_probability"]
+            rationale = item["wf_rationale"]
+            tokens_used = 0
+            latency_ms = 0
             return {**item, "probability": probability, "rationale": rationale,
                     "tokens_used": tokens_used, "latency_ms": latency_ms}
 
